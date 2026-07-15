@@ -203,6 +203,34 @@ async def test_malformed_auth_header():
 
 
 @pytest.mark.asyncio
+async def test_bad_token_in_url():
+    """A wrong URL token must not authorize (falls through to header auth)."""
+    with pytest.raises(
+        websockets.exceptions.InvalidStatus,
+        check=lambda e: e.response.status_code == 401,
+    ):
+        async with ColabWebSocketServer() as server:
+            await websockets.connect(
+                f"ws://localhost:{server.port}?access_token=wrong_token",
+                origin="https://colab.google.com",
+                subprotocols=["mcp"],
+            )
+
+
+@pytest.mark.asyncio
+async def test_token_substring_in_other_param_rejected():
+    """Regression: the token appearing as a substring of another query value
+    must not authorize (the old check did a raw substring match on the path)."""
+    with pytest.raises(websockets.exceptions.InvalidStatus):
+        async with ColabWebSocketServer() as server:
+            await websockets.connect(
+                f"ws://localhost:{server.port}?foo=access_token={server.token}",
+                origin="https://colab.google.com",
+                subprotocols=["mcp"],
+            )
+
+
+@pytest.mark.asyncio
 async def test_token_in_url():
     async with ColabWebSocketServer() as server:
         client = await websockets.connect(

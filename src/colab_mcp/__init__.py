@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import datetime
 import logging
+import os
 import tempfile
 import sys
 
@@ -28,7 +29,11 @@ from colab_mcp.session import ColabSessionProxy
 mcp = FastMCP(name="ColabMCP")
 
 
+DEFAULT_LOG_DIR = os.path.join(tempfile.gettempdir(), "colab-mcp-logs")
+
+
 def init_logger(logdir):
+    os.makedirs(logdir, exist_ok=True)
     log_filename = datetime.datetime.now().strftime(
         f"{logdir}/colab-mcp.%Y-%m-%d_%H-%M-%S.log"
     )
@@ -38,7 +43,7 @@ def init_logger(logdir):
         filename=log_filename,
         level=logging.INFO,  # Set the minimum logging level to capture
     )
-    fastmcp_logger.get_logger("colab-mcp").info("logging to %s" % log_filename)
+    fastmcp_logger.get_logger("colab-mcp").info("logging to %s", log_filename)
 
 
 def parse_args(v):
@@ -48,16 +53,16 @@ def parse_args(v):
     parser.add_argument(
         "-l",
         "--log",
-        help="if set, use this directory as a location for logfiles (if unset, will log to %s/colab-mcp-logs/)"
-        % tempfile.gettempdir(),
+        help="if set, use this directory as a location for logfiles (if unset, will log to %s)"
+        % DEFAULT_LOG_DIR,
         action="store",
-        default=tempfile.mkdtemp(prefix="colab-mcp-logs-"),
+        default=DEFAULT_LOG_DIR,
     )
     parser.add_argument(
         "-p",
         "--enable-proxy",
-        help="if set, enable the runtime proxy (enabled by default).",
-        action="store_true",
+        help="enable the runtime proxy (enabled by default; disable with --no-enable-proxy).",
+        action=argparse.BooleanOptionalAction,
         default=True,
     )
     return parser.parse_args(v)
@@ -67,6 +72,7 @@ async def main_async():
     args = parse_args(sys.argv[1:])
     init_logger(args.log)
 
+    session_mcp = None
     if args.enable_proxy:
         logging.info("enabling session proxy tools")
         session_mcp = ColabSessionProxy()
@@ -79,7 +85,7 @@ async def main_async():
         await mcp.run_async()
 
     finally:
-        if args.enable_proxy:
+        if session_mcp is not None:
             await session_mcp.cleanup()
 
 

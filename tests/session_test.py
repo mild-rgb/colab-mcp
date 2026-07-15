@@ -13,10 +13,13 @@
 # limitations under the License.
 
 import asyncio
+import json
 from colab_mcp import session
+from colab_mcp.websocket_server import ColabWebSocketServer
 from fastmcp.server.middleware import MiddlewareContext
 import pytest
 from unittest.mock import patch, AsyncMock, Mock
+import websockets
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +40,7 @@ def mock_wss():
 class MockColabWebSocketServer:
     def __init__(self):
         self.connection_live = asyncio.Event()
+        self.connection_closed = asyncio.Event()
         self.read_stream = AsyncMock()
         self.write_stream = AsyncMock()
         self.token = "test-token"
@@ -144,17 +148,26 @@ class TestColabProxyMiddleware:
         assert result.structured_content == {"result": False}
 
 
+def _get_injected_tool_fn(proxy, name):
+    tool = next(t for t in proxy._make_injected_tools() if t.name == name)
+    return tool.fn
+
+
 class TestCheckSessionProxyToolFn:
     @pytest.mark.asyncio
     async def test_connected(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
         ctx = Mock()
         ctx.get_state.side_effect = (
             lambda k: True if k == session.FE_CONNECTED_KEY else None
         )
-        assert await session.check_session_proxy_tool_fn(ctx) is True
+        tool_fn = _get_injected_tool_fn(proxy, session.INJECTED_TOOL_NAME)
+        assert await tool_fn(ctx) is True
 
     @pytest.mark.asyncio
-    async def test_disconnected(self, mock_webbrowser):
+    async def test_disconnected(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        proxy.open_browser = Mock()
         ctx = Mock()
 
         def get_state(k):
@@ -167,11 +180,31 @@ class TestCheckSessionProxyToolFn:
             return None
 
         ctx.get_state.side_effect = get_state
-        assert await session.check_session_proxy_tool_fn(ctx) is False
-        mock_webbrowser.assert_called_once()
-        args, _ = mock_webbrowser.call_args
-        assert "mcpProxyToken=test-token" in args[0]
-        assert "mcpProxyPort=1234" in args[0]
+        tool_fn = _get_injected_tool_fn(proxy, session.INJECTED_TOOL_NAME)
+        assert await tool_fn(ctx) is False
+        proxy.open_browser.assert_called_once()
+        (url,), _ = proxy.open_browser.call_args
+        assert "mcpProxyToken=test-token" in url
+        assert "mcpProxyPort=1234" in url
+
+    @pytest.mark.asyncio
+    async def test_open_browser_webbrowser_fallback(self, mock_webbrowser):
+        """open_browser keeps a task reference and falls back to webbrowser
+        when the Playwright launch fails."""
+        browser = Mock()
+        browser.launch = AsyncMock(side_effect=RuntimeError("no playwright"))
+        proxy = session.ColabSessionProxy(browser=browser)
+
+        proxy.open_browser("http://example.test/nb")
+
+        assert isinstance(proxy._browser_task, asyncio.Task)
+        await asyncio.wait_for(proxy._browser_task, timeout=2)
+        # the fallback runs webbrowser.open_new in a short-lived thread
+        for _ in range(100):
+            if mock_webbrowser.call_count:
+                break
+            await asyncio.sleep(0.01)
+        mock_webbrowser.assert_called_once_with("http://example.test/nb")
 
 
 class TestColabProxyClient:
@@ -195,28 +228,109 @@ class TestColabProxyClient:
         assert client.client_factory() is client.stubbed_mcp_client
 
     @pytest.mark.asyncio
-    async def test_await_proxy_connection(self, mock_wss):
+    async def test_await_proxy_connection_timeout(self, mock_wss):
         client = session.ColabProxyClient(mock_wss)
-        client._start_task = asyncio.create_task(asyncio.sleep(0.01))
-        mock_wss.connection_live.set()
-        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.1):
+        with patch("colab_mcp.session.UI_CONNECTION_TIMEOUT", 0.05):
+            # returns quietly on timeout instead of raising
             await client.await_proxy_connection()
-        await client._start_task
+
+    @pytest.mark.asyncio
+    async def test_await_proxy_connection_ready(self, mock_wss):
+        client = session.ColabProxyClient(mock_wss)
+        client.client_ready.set()
+        await asyncio.wait_for(client.await_proxy_connection(), timeout=1)
 
     @pytest.mark.asyncio
     @patch("colab_mcp.session.Client")
     @patch("colab_mcp.session.ColabTransport", spec=session.ColabTransport)
-    async def test_start_proxy_client(
+    async def test_manager_connects_and_reconnects(
         self, mock_colab_transport, mock_client, mock_wss
     ):
-        mock_client.return_value.__aenter__ = AsyncMock()
-        client = session.ColabProxyClient(mock_wss)
-        mock_wss.connection_live.set()
-        async with client:
-            await client._start_task
+        mock_client.return_value.__aenter__ = AsyncMock(
+            return_value=mock_client.return_value
+        )
+        mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+        async with session.ColabProxyClient(mock_wss) as client:
+            # frontend connects
+            mock_wss.connection_closed.clear()
+            mock_wss.connection_live.set()
+            await asyncio.wait_for(client.client_ready.wait(), timeout=1)
+            assert client.is_connected()
+            mock_colab_transport.assert_called_with(mock_wss)
 
-        mock_colab_transport.assert_called_once_with(mock_wss)
-        mock_client.assert_called_with(mock_colab_transport.return_value)
+            # frontend disconnects: the proxy client is torn down
+            mock_wss.connection_live.clear()
+            mock_wss.connection_closed.set()
+            for _ in range(100):
+                if not client.client_ready.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert client.proxy_mcp_client is None
+            assert not client.is_connected()
+
+            # frontend reconnects: a fresh client session is established
+            mock_wss.connection_closed.clear()
+            mock_wss.connection_live.set()
+            await asyncio.wait_for(client.client_ready.wait(), timeout=1)
+            assert client.is_connected()
+            # one Client per frontend connection (the stub client in __init__
+            # also counts one Client() call, so filter to transport-backed ones)
+            proxy_session_calls = [
+                c
+                for c in mock_client.call_args_list
+                if c.args and c.args[0] is mock_colab_transport.return_value
+            ]
+            assert len(proxy_session_calls) == 2
+
+
+async def _serve_fake_frontend_handshake(ws):
+    """Act as the Colab frontend's MCP server for the initialize handshake."""
+    init = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+    assert init["method"] == "initialize"
+    await ws.send(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": init["id"],
+                "result": {
+                    "protocolVersion": init["params"]["protocolVersion"],
+                    "capabilities": {},
+                    "serverInfo": {"name": "fake-colab", "version": "0.0"},
+                },
+            }
+        )
+    )
+    note = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+    assert note["method"] == "notifications/initialized"
+
+
+class TestFrontendReconnect:
+    @pytest.mark.asyncio
+    async def test_reconnect_gets_fresh_session(self):
+        """A Colab tab that disconnects and reconnects must be able to complete
+        a brand-new MCP handshake (regression: the old single-shot client left
+        the bridge unusable after the first disconnect)."""
+        async with ColabWebSocketServer() as wss:
+            async with session.ColabProxyClient(wss) as pc:
+                for _attempt in range(2):
+                    ws = await websockets.connect(
+                        f"ws://localhost:{wss.port}?access_token={wss.token}",
+                        origin="https://colab.google.com",
+                        subprotocols=["mcp"],
+                    )
+                    await _serve_fake_frontend_handshake(ws)
+                    await asyncio.wait_for(pc.client_ready.wait(), timeout=5)
+                    assert pc.is_connected()
+
+                    await ws.close()
+                    for _ in range(500):
+                        if (
+                            not pc.client_ready.is_set()
+                            and not wss.connection_live.is_set()
+                        ):
+                            break
+                        await asyncio.sleep(0.01)
+                    assert not pc.is_connected()
 
 
 class TestColabTransport:

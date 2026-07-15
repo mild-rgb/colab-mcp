@@ -20,6 +20,7 @@ import mcp.types as types
 from mcp.shared.message import SessionMessage
 from pydantic_core import ValidationError
 import secrets
+from urllib.parse import parse_qs, urlsplit
 import websockets
 from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
@@ -31,6 +32,11 @@ from websockets.typing import Subprotocol
 COLAB = "https://colab.research.google.com"
 COLAB_ALT_DOMAIN = "https://colab.google.com"
 SCRATCH_PATH = "/notebooks/empty.ipynb"
+
+# PATCH: default max_size is 1 MiB; large notebook-state syncs from the Colab
+# frontend exceed it and close the socket with 1009 MESSAGE_TOO_BIG. Use a
+# large finite cap so big cell-output syncs fit without unbounded buffering.
+MAX_WS_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
 class ColabWebSocketServer:
@@ -44,6 +50,9 @@ class ColabWebSocketServer:
         self.port = 0
         self.connection_lock = asyncio.Lock()
         self.connection_live = asyncio.Event()
+        # Set each time a connection ends, so the proxy client can tear down
+        # its MCP session and wait for the next connection's fresh streams.
+        self.connection_closed = asyncio.Event()
         self.allowed_origins = [COLAB, COLAB_ALT_DOMAIN]
         self._server: websockets.Server | None = None
 
@@ -52,13 +61,16 @@ class ColabWebSocketServer:
         self.write_stream: MemoryObjectSendStream[SessionMessage]
         self._write_stream_reader: MemoryObjectReceiveStream[SessionMessage]
 
+        self._new_streams()
+        self.token = secrets.token_urlsafe(16)
+
+    def _new_streams(self):
         self._read_stream_writer, self.read_stream = anyio.create_memory_object_stream(
             0
         )
         self.write_stream, self._write_stream_reader = (
             anyio.create_memory_object_stream(0)
         )
-        self.token = secrets.token_urlsafe(16)
 
     async def _read_from_socket(self, websocket):
         """Listens to the socket and puts messages into the read stream."""
@@ -89,7 +101,11 @@ class ColabWebSocketServer:
             pass
 
     def _validate_authorization(self, websocket: ServerConnection, request: Request):
-        if request.path.find(f"access_token={self.token}") != -1:
+        query = parse_qs(urlsplit(request.path).query)
+        if any(
+            secrets.compare_digest(candidate, self.token)
+            for candidate in query.get("access_token", [])
+        ):
             return None
         try:
             headers: Headers = request.headers
@@ -101,7 +117,7 @@ class ColabWebSocketServer:
                 return Response(400, "Invalid authorization header", Headers([]))
         except ValueError:
             return Response(400, "Invalid header format", Headers([]))
-        if token == self.token:
+        if secrets.compare_digest(token, self.token):
             return None
         return Response(403, "Bad authorization token", Headers([]))
 
@@ -119,6 +135,7 @@ class ColabWebSocketServer:
 
         async with self.connection_lock:
             try:
+                self.connection_closed.clear()
                 self.connection_live.set()
 
                 reading_task = asyncio.create_task(self._read_from_socket(websocket))
@@ -132,13 +149,17 @@ class ColabWebSocketServer:
 
             except websockets.exceptions.ConnectionClosed as e:
                 logging.info(f"Connection closed: {e.code} - {e.reason}")
-                await self._read_stream_writer.send(
-                    Exception("Colab Frontend disconnected")
-                )
             except Exception as e:
                 logging.error(f"Unexpected error: {e}")
             finally:
+                # Retire this connection's streams (ending the proxy client's
+                # MCP session) and stage fresh ones, so a reconnecting frontend
+                # gets a clean session with a new initialize handshake.
+                self._read_stream_writer.close()
+                self._write_stream_reader.close()
+                self._new_streams()
                 self.connection_live.clear()
+                self.connection_closed.set()
 
     async def __aenter__(self):
         self._server = await websockets.serve(
@@ -148,6 +169,7 @@ class ColabWebSocketServer:
             subprotocols=[Subprotocol("mcp")],
             origins=self.allowed_origins,
             process_request=self._validate_authorization,
+            max_size=MAX_WS_MESSAGE_BYTES,
         )
         self.port = self._server.sockets[0].getsockname()[1]
         logging.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
