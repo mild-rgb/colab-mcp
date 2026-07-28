@@ -378,3 +378,408 @@ class TestColabSessionProxy:
         proxy._exit_stack = AsyncMock()
         await proxy.cleanup()
         proxy._exit_stack.aclose.assert_called_once()
+
+
+class TestColabNotebookPath:
+    @pytest.mark.parametrize(
+        "ref,expected",
+        [
+            ("", "/notebooks/empty.ipynb"),
+            ("new", "/notebooks/empty.ipynb"),
+            ("  Scratch  ", "/notebooks/empty.ipynb"),
+            (
+                "1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy",
+                "/drive/1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy",
+            ),
+            ("/drive/abc123", "/drive/abc123"),
+            (
+                "https://colab.research.google.com/drive/1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy",
+                "/drive/1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy",
+            ),
+            (
+                "colab.research.google.com/drive/abcdefghijklmnop",
+                "/drive/abcdefghijklmnop",
+            ),
+            (
+                "https://drive.google.com/file/d/1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy/view?usp=sharing",
+                "/drive/1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy",
+            ),
+            (
+                "https://github.com/owner/repo/blob/main/nb.ipynb",
+                "/github/owner/repo/blob/main/nb.ipynb",
+            ),
+            (
+                "https://gist.github.com/owner/deadbeef",
+                "/gist/owner/deadbeef",
+            ),
+        ],
+    )
+    def test_resolves(self, ref, expected):
+        assert session.colab_notebook_path(ref) == expected
+
+    def test_drive_url_without_id_is_rejected(self):
+        with pytest.raises(ValueError, match="no Drive file id"):
+            session.colab_notebook_path("https://drive.google.com/drive/my-drive")
+
+    def test_unknown_host_is_rejected(self):
+        with pytest.raises(ValueError, match="unrecognised notebook reference"):
+            session.colab_notebook_path("https://example.test/nb.ipynb")
+
+    def test_url_carries_current_token_and_drops_stale_fragment(self):
+        url = session.colab_notebook_url(
+            "https://colab.research.google.com/drive/abc123def456ghi"
+            "#mcpProxyToken=STALE&mcpProxyPort=1",
+            "fresh-token",
+            4321,
+        )
+        assert url == (
+            "https://colab.research.google.com/drive/abc123def456ghi"
+            "#mcpProxyToken=fresh-token&mcpProxyPort=4321"
+        )
+        assert "STALE" not in url
+
+
+class TestOpenNotebook:
+    def _proxy(self, connected_after=0):
+        """Proxy whose frontend reports connected after N is_connected calls."""
+        browser = Mock()
+        browser.navigate = AsyncMock()
+        browser.ensure_signed_in = AsyncMock(return_value=True)
+        browser.click_connect = AsyncMock(return_value=False)
+        browser.title = AsyncMock(return_value="nb.ipynb - Colab")
+        proxy = session.ColabSessionProxy(browser=browser)
+        calls = {"n": 0}
+
+        def is_connected():
+            calls["n"] += 1
+            return calls["n"] > connected_after
+
+        proxy.proxy_client = Mock(spec=session.ColabProxyClient)
+        proxy.proxy_client.is_connected.side_effect = is_connected
+        return proxy
+
+    @pytest.mark.asyncio
+    async def test_navigates_and_reports_connection(self, monkeypatch):
+        monkeypatch.setattr(session, "UI_CONNECTION_TIMEOUT", 3)
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        proxy = self._proxy(connected_after=1)  # not connected before navigating
+
+        assert await proxy.open_notebook("http://colab.test/nb#tok") is True
+        proxy.browser.navigate.assert_awaited_once_with("http://colab.test/nb#tok")
+
+    @pytest.mark.asyncio
+    async def test_waits_for_stale_connection_to_drop(self, monkeypatch):
+        """A live socket immediately after navigating belongs to the old tab."""
+        monkeypatch.setattr(session, "UI_CONNECTION_TIMEOUT", 3)
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        browser = Mock()
+        browser.navigate = AsyncMock()
+        browser.ensure_signed_in = AsyncMock(return_value=True)
+        browser.click_connect = AsyncMock(return_value=False)
+        proxy = session.ColabSessionProxy(browser=browser)
+        # connected, then the old tab drops, then the new tab connects
+        states = [True, True, False, True]
+        proxy.proxy_client = Mock(spec=session.ColabProxyClient)
+        proxy.proxy_client.is_connected.side_effect = (
+            lambda: states.pop(0) if states else True
+        )
+
+        assert await proxy.open_notebook("http://colab.test/nb") is True
+        assert states == []  # the stale-drop poll consumed the leading Trues
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_timeout(self, monkeypatch):
+        monkeypatch.setattr(session, "UI_CONNECTION_TIMEOUT", 3)
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        browser = Mock()
+        browser.navigate = AsyncMock()
+        browser.ensure_signed_in = AsyncMock(return_value=True)
+        browser.click_connect = AsyncMock(return_value=False)
+        proxy = session.ColabSessionProxy(browser=browser)
+        proxy.proxy_client = Mock(spec=session.ColabProxyClient)
+        proxy.proxy_client.is_connected.return_value = False
+
+        assert await proxy.open_notebook("http://colab.test/nb") is False
+        # keeps retrying the dialog for the whole window
+        assert browser.click_connect.await_count == 3
+
+
+class TestOpenColabNotebookToolFn:
+    def _ctx(self):
+        ctx = Mock()
+        ctx.get_state.side_effect = lambda k: {
+            session.PROXY_TOKEN_KEY: "test-token",
+            session.PROXY_PORT_KEY: 1234,
+        }.get(k)
+        ctx.report_progress = AsyncMock()
+        ctx.send_tool_list_changed = AsyncMock()
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_opens_and_refreshes_tool_list(self):
+        browser = Mock()
+        browser.title = AsyncMock(return_value="junk_tokens_steering.ipynb - Colab")
+        proxy = session.ColabSessionProxy(browser=browser)
+        proxy.open_notebook = AsyncMock(return_value=True)
+        ctx = self._ctx()
+
+        tool_fn = _get_injected_tool_fn(proxy, session.OPEN_NOTEBOOK_TOOL_NAME)
+        result = await tool_fn("1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy", ctx)
+
+        (url,), kwargs = proxy.open_notebook.call_args
+        assert url == (
+            "https://colab.research.google.com/drive/1oiVJRXMQfLAIlVsmRcxF5lkYSdBnjtxy"
+            "#mcpProxyToken=test-token&mcpProxyPort=1234"
+        )
+        assert "junk_tokens_steering.ipynb" in result
+        assert "connected" in result
+        # the proxied editing tools belong to the tab we just left
+        ctx.send_tool_list_changed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reports_unconnected_frontend(self):
+        browser = Mock()
+        browser.title = AsyncMock(return_value="nb.ipynb - Colab")
+        proxy = session.ColabSessionProxy(browser=browser)
+        proxy.open_notebook = AsyncMock(return_value=False)
+
+        tool_fn = _get_injected_tool_fn(proxy, session.OPEN_NOTEBOOK_TOOL_NAME)
+        result = await tool_fn("abc123def456ghi", self._ctx())
+        assert "did not connect" in result
+
+    @pytest.mark.asyncio
+    async def test_bad_reference_returns_error_without_navigating(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        proxy.open_notebook = AsyncMock()
+
+        tool_fn = _get_injected_tool_fn(proxy, session.OPEN_NOTEBOOK_TOOL_NAME)
+        result = await tool_fn("https://example.test/nb.ipynb", self._ctx())
+        assert result.startswith("error:")
+        proxy.open_notebook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_navigation_failure_is_reported(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        proxy.open_notebook = AsyncMock(side_effect=RuntimeError("page crashed"))
+
+        tool_fn = _get_injected_tool_fn(proxy, session.OPEN_NOTEBOOK_TOOL_NAME)
+        result = await tool_fn("abc123def456ghi", self._ctx())
+        assert result.startswith("error: could not open")
+        assert "page crashed" in result
+
+
+class TestKernelToolWiring:
+    """The kernel tools are injected alongside — never instead of — the
+    browser-level tools the improvements doc asked us not to regress."""
+
+    KERNEL_TOOLS = [
+        "interrupt_execution",
+        "restart_kernel",
+        "run_code_cell_async",
+        "get_execution_status",
+        "get_kernel_status",
+        "execute_transient",
+        "eval_expression",
+        "run_cells",
+        "run_all_below",
+        "get_cell_output",
+        "get_notebook_outline",
+        "get_runtime_info",
+        "export_notebook",
+        "download_file",
+        "upload_file",
+    ]
+
+    PRESERVED_TOOLS = [
+        session.INJECTED_TOOL_NAME,
+        session.OPEN_NOTEBOOK_TOOL_NAME,
+        "set_gpu_runtime",
+        "screenshot_colab",
+    ]
+
+    def _names(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        return [t.name for t in proxy._make_injected_tools()]
+
+    def test_every_kernel_tool_is_injected(self):
+        names = self._names()
+        assert [t for t in self.KERNEL_TOOLS if t not in names] == []
+
+    def test_the_existing_tools_are_preserved(self):
+        names = self._names()
+        assert [t for t in self.PRESERVED_TOOLS if t not in names] == []
+
+    def test_tool_names_are_unique(self):
+        names = self._names()
+        assert len(names) == len(set(names))
+
+    def test_every_tool_has_a_description(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        assert all(t.description for t in proxy._make_injected_tools())
+
+    def test_the_kernel_shares_the_sessions_browser(self):
+        browser = Mock()
+        proxy = session.ColabSessionProxy(browser=browser)
+        assert proxy.kernel.browser is browser
+
+    def test_the_kernel_reads_the_proxy_client_lazily(self):
+        """KernelTools is built in __init__, before start_proxy_server exists."""
+        proxy = session.ColabSessionProxy(browser=Mock())
+        assert proxy.kernel.tools.is_connected() is False
+        proxy.proxy_client = Mock()
+        proxy.proxy_client.is_connected.return_value = True
+        assert proxy.kernel.tools.is_connected() is True
+
+    @pytest.mark.asyncio
+    async def test_a_disconnected_frontend_is_reported_as_data(self):
+        """These tools are callable before a notebook is open, so a missing
+        frontend must not surface as an MCP error the agent has to interpret."""
+        proxy = session.ColabSessionProxy(browser=Mock())
+        tool_fn = _get_injected_tool_fn(proxy, "get_kernel_status")
+
+        result = await tool_fn()
+
+        assert result["state"] == "disconnected"
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_failure_is_reported_as_data(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        proxy.kernel.eval_expression = AsyncMock(side_effect=RuntimeError("kaboom"))
+        tool_fn = _get_injected_tool_fn(proxy, "eval_expression")
+
+        result = await tool_fn("1 + 1")
+
+        assert result == {"error": "RuntimeError: kaboom"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool_name,kernel_method,args,expected",
+        [
+            ("interrupt_execution", "interrupt", (), {"cancel_pending": True}),
+            ("restart_kernel", "restart_kernel", (), {}),
+            ("run_code_cell_async", "run_cell_async", ("c1",), {}),
+            ("get_kernel_status", "kernel_status", (), {}),
+            ("get_runtime_info", "runtime_info", (), {}),
+            ("run_cells", "run_cells", (["a", "b"],), {"stop_on_error": True}),
+            ("run_all_below", "run_all_below", ("c1",), {"stop_on_error": True}),
+            ("download_file", "download_file", ("/r", "/l"), {}),
+            ("upload_file", "upload_file", ("/l", "/r"), {}),
+        ],
+    )
+    async def test_tools_delegate_to_the_kernel(
+        self, tool_name, kernel_method, args, expected
+    ):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        stub = AsyncMock(return_value={"ok": True})
+        setattr(proxy.kernel, kernel_method, stub)
+
+        result = await _get_injected_tool_fn(proxy, tool_name)(*args)
+
+        assert result == {"ok": True}
+        called_args, called_kwargs = stub.call_args
+        assert called_args == args
+        for key, value in expected.items():
+            assert called_kwargs[key] == value
+
+
+class TestImportNotebook:
+    """import_notebook is the inverse of export_notebook: a local .ipynb becomes
+    a real Drive notebook, not bytes on the VM's scratch disk."""
+
+    def _proxy(self, notebook_id="NEWID123", connected=True):
+        browser = Mock()
+        browser.upload_notebook = AsyncMock(return_value=notebook_id)
+        proxy = session.ColabSessionProxy(browser=browser)
+        proxy.open_notebook = AsyncMock(return_value=connected)
+        return proxy
+
+    def _notebook(self, tmp_path, cells=2):
+        path = tmp_path / "local.ipynb"
+        path.write_text(
+            json.dumps({"cells": [{"cell_type": "code", "source": []}] * cells, "nbformat": 4})
+        )
+        return str(path)
+
+    @pytest.mark.asyncio
+    async def test_uploads_then_reattaches_the_bridge(self, tmp_path):
+        """Uploading navigates the tab and drops the websocket, so the imported
+        notebook must be reopened with a tokened URL."""
+        proxy = self._proxy()
+        src = self._notebook(tmp_path)
+
+        result = await proxy.import_notebook(src, "tok", 4321)
+
+        proxy.browser.upload_notebook.assert_awaited_once_with(src)
+        (url,), _ = proxy.open_notebook.call_args
+        assert "/drive/NEWID123" in url
+        assert "mcpProxyToken=tok" in url and "mcpProxyPort=4321" in url
+        assert result["notebook_id"] == "NEWID123"
+        assert result["cells"] == 2
+        assert result["connected"] is True
+        assert "#" not in result["url"]
+
+    @pytest.mark.asyncio
+    async def test_reports_a_bridge_that_did_not_reconnect(self, tmp_path):
+        proxy = self._proxy(connected=False)
+        result = await proxy.import_notebook(self._notebook(tmp_path), "tok", 1)
+        assert result["connected"] is False
+
+    @pytest.mark.asyncio
+    async def test_rejects_a_missing_file_without_touching_the_browser(self, tmp_path):
+        proxy = self._proxy()
+        result = await proxy.import_notebook(str(tmp_path / "absent.ipynb"), "tok", 1)
+        assert "no such file" in result["error"]
+        proxy.browser.upload_notebook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_unparseable_json_before_uploading(self, tmp_path):
+        """Validate locally rather than after it is already in the user's Drive."""
+        proxy = self._proxy()
+        bad = tmp_path / "bad.ipynb"
+        bad.write_text("{not json")
+
+        result = await proxy.import_notebook(str(bad), "tok", 1)
+
+        assert "not readable JSON" in result["error"]
+        proxy.browser.upload_notebook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_json_that_is_not_a_notebook(self, tmp_path):
+        proxy = self._proxy()
+        wrong = tmp_path / "wrong.ipynb"
+        wrong.write_text(json.dumps({"hello": "world"}))
+
+        result = await proxy.import_notebook(str(wrong), "tok", 1)
+
+        assert "does not look like a .ipynb" in result["error"]
+        proxy.browser.upload_notebook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_tool_is_injected_and_refreshes_the_tool_list(self, tmp_path):
+        proxy = self._proxy()
+        ctx = Mock()
+        ctx.get_state.side_effect = lambda k: {
+            session.PROXY_TOKEN_KEY: "tok",
+            session.PROXY_PORT_KEY: 4321,
+        }.get(k)
+        ctx.send_tool_list_changed = AsyncMock()
+
+        tool_fn = _get_injected_tool_fn(proxy, "import_notebook")
+        result = await tool_fn(self._notebook(tmp_path), ctx)
+
+        assert result["notebook_id"] == "NEWID123"
+        # the editing tools belong to the tab we navigated away from
+        ctx.send_tool_list_changed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_upload_failure_is_reported_as_data(self, tmp_path):
+        proxy = self._proxy()
+        proxy.browser.upload_notebook = AsyncMock(side_effect=RuntimeError("no menu"))
+        ctx = Mock()
+        ctx.get_state.return_value = "tok"
+        ctx.send_tool_list_changed = AsyncMock()
+
+        tool_fn = _get_injected_tool_fn(proxy, "import_notebook")
+        result = await tool_fn(self._notebook(tmp_path), ctx)
+
+        assert result == {"error": "RuntimeError: no menu"}
