@@ -680,3 +680,77 @@ class TestUploadNotebook:
         src.write_text("{}")
         with pytest.raises(RuntimeError, match="browser not open"):
             await ColabBrowser().upload_notebook(str(src))
+
+
+class TestSignedOutDetection:
+    """A Colab notebook that renders anonymously shows no interstitial, only a
+    "Sign in" button in the toolbar. Missing it made ensure_signed_in() a no-op
+    and let a signed-out session report itself as connected."""
+
+    @pytest.mark.asyncio
+    async def test_detects_toolbar_sign_in_button(self, colab, page):
+        page.add(("role", "button", "Sign in"))
+        assert await colab._needs_signin_on_colab() is True
+        assert await colab.is_signed_in() is False
+
+    @pytest.mark.asyncio
+    async def test_detects_sign_in_link(self, colab, page):
+        page.add(("role", "link", "Sign in"))
+        assert await colab._needs_signin_on_colab() is True
+
+    @pytest.mark.asyncio
+    async def test_still_detects_the_interstitial(self, colab, page):
+        page.add(("text", "must be logged in with a Google Account"))
+        assert await colab._needs_signin_on_colab() is True
+
+    @pytest.mark.asyncio
+    async def test_signed_in_page_has_no_affordance(self, colab, page):
+        assert await colab._needs_signin_on_colab() is False
+        assert await colab.is_signed_in() is True
+
+    @pytest.mark.asyncio
+    async def test_ignores_sign_in_text_off_colab(self, colab, page):
+        # Google's own sign-in pages carry a "Sign in" button; treating that as
+        # "Colab needs sign-in" would bounce us around the flow forever.
+        page.url = "https://accounts.google.com/v3/signin/challenge/pwd"
+        page.add(("role", "button", "Sign in"))
+        assert await colab._needs_signin_on_colab() is False
+
+    @pytest.mark.asyncio
+    async def test_on_signin_page_is_not_signed_in(self, colab, page):
+        page.url = "https://accounts.google.com/v3/signin/accountchooser"
+        assert await colab.is_signed_in() is False
+
+
+class TestProfileSyncOptOut:
+    """COLAB_MCP_SKIP_PROFILE_SYNC keeps a signed-in automation profile intact,
+    which is what makes unattended use possible."""
+
+    def test_sync_copies_by_default(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        (src / "Default").mkdir(parents=True)
+        (src / "Default" / "Cookies").write_text("cookie-data")
+        dst = tmp_path / "pw"
+        monkeypatch.setattr(browser_mod, "SRC_PROFILE", str(src))
+        monkeypatch.setattr(browser_mod, "PW_PROFILE", str(dst))
+        monkeypatch.setattr(browser_mod, "SKIP_PROFILE_SYNC", False)
+
+        browser_mod._sync_login_profile()
+
+        assert (dst / "Default" / "Cookies").read_text() == "cookie-data"
+
+    def test_sync_is_a_no_op_when_opted_out(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        (src / "Default").mkdir(parents=True)
+        (src / "Default" / "Cookies").write_text("signed-out-source")
+        dst = tmp_path / "pw"
+        (dst / "Default").mkdir(parents=True)
+        (dst / "Default" / "Cookies").write_text("signed-in-automation")
+        monkeypatch.setattr(browser_mod, "SRC_PROFILE", str(src))
+        monkeypatch.setattr(browser_mod, "PW_PROFILE", str(dst))
+        monkeypatch.setattr(browser_mod, "SKIP_PROFILE_SYNC", True)
+
+        browser_mod._sync_login_profile()
+
+        # The automation profile's own login survives untouched.
+        assert (dst / "Default" / "Cookies").read_text() == "signed-in-automation"

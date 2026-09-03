@@ -60,6 +60,17 @@ _DEFAULT_FILES = [
 ]
 
 
+# Copying the source profile over PW_PROFILE on every launch is what carries a
+# fresh Chrome login through to automation. It also destroys any session
+# established *inside* PW_PROFILE -- the only kind that can survive unattended
+# when the day-to-day profile is signed out. Set COLAB_MCP_SKIP_PROFILE_SYNC=1
+# to keep the automation profile self-contained: sign in once in the automation
+# window and it persists across launches.
+SKIP_PROFILE_SYNC = os.environ.get(
+    "COLAB_MCP_SKIP_PROFILE_SYNC", ""
+).strip().lower() in ("1", "true", "yes")
+
+
 # Which Google account to pick when the chooser offers more than one. Read from
 # the Chrome profile when unset. colab-mcp never reads or types a password:
 # the sign-in flow is clicked through and Chrome's own password manager fills
@@ -114,7 +125,17 @@ def _free_port() -> int:
 
 
 def _sync_login_profile() -> None:
-    """Copy the login-essential files from the user's profile into PW_PROFILE."""
+    """Copy the login-essential files from the user's profile into PW_PROFILE.
+
+    No-op when COLAB_MCP_SKIP_PROFILE_SYNC is set, so an automation profile that
+    is already signed in is not clobbered by a signed-out source profile.
+    """
+    if SKIP_PROFILE_SYNC:
+        logging.info(
+            "colab-mcp: COLAB_MCP_SKIP_PROFILE_SYNC set; keeping the existing login in %s",
+            PW_PROFILE,
+        )
+        return
     os.makedirs(os.path.join(PW_PROFILE, "Default"), exist_ok=True)
     for rel in _TOP_FILES:
         src = os.path.join(SRC_PROFILE, rel)
@@ -235,16 +256,37 @@ class ColabBrowser:
         return any(host in url for host in _SIGNIN_HOSTS)
 
     async def _needs_signin_on_colab(self) -> bool:
-        """Colab's own "You must be logged in..." interstitial is showing."""
+        """We are on a Colab page that is not signed in.
+
+        Two shapes, and only the first used to be checked: Colab's "You must be
+        logged in..." interstitial, and -- on a notebook Colab renders
+        anonymously, such as the scratch notebook -- no interstitial at all,
+        just a "Sign in" button in the top-right toolbar. Missing the second
+        meant ensure_signed_in() returned True having done nothing, and the
+        session reported as connected while being unusable.
+        """
         if self.page is None:
             return False
         with contextlib.suppress(Exception):
-            return bool(
-                await self.page.get_by_text(
-                    "must be logged in with a Google Account", exact=False
-                ).count()
-            )
+            if await self.page.get_by_text(
+                "must be logged in with a Google Account", exact=False
+            ).count():
+                return True
+        # Only trust the toolbar affordance on an actual Colab page, so stray
+        # "Sign in" text elsewhere cannot strand us in the sign-in loop.
+        with contextlib.suppress(Exception):
+            if "colab" not in (self.page.url or "").lower():
+                return False
+            for role in ("button", "link"):
+                if await self.page.get_by_role(role, name="Sign in", exact=True).count():
+                    return True
         return False
+
+    async def is_signed_in(self) -> bool:
+        """Whether the current page is a usable, signed-in Colab session."""
+        if self.page is None:
+            return False
+        return not await self._on_signin_page() and not await self._needs_signin_on_colab()
 
     async def ensure_signed_in(self, timeout_s: float = 90.0) -> bool:
         """Click through Google's sign-in flow if Colab redirected to it.
