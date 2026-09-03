@@ -509,6 +509,9 @@ class ColabSessionProxy:
         async def restart_kernel_fn() -> dict:
             return await guarded(k.restart_kernel())
 
+        async def delete_runtime_fn() -> dict:
+            return await guarded(k.delete_runtime())
+
         async def run_code_cell_async_fn(cellId: str) -> dict:
             return await guarded(k.run_cell_async(cellId))
 
@@ -588,6 +591,22 @@ class ColabSessionProxy:
                     "Restarts the Colab kernel (Runtime > Restart session) without "
                     "changing the hardware accelerator — unlike set_gpu_runtime. "
                     "All kernel state is lost. Returns {restarted}."
+                ),
+            ),
+            Tool.from_function(
+                fn=delete_runtime_fn,
+                name="delete_runtime",
+                description=(
+                    "Disconnects and DELETES the Colab runtime VM (Runtime > "
+                    "Disconnect and delete runtime). Destructive and not "
+                    "reversible: unlike restart_kernel, which restarts Python on "
+                    "the same machine and leaves /content intact, this discards "
+                    "the machine itself — kernel state, uploaded files, pip "
+                    "installs and mounted Drive all go with it. Use it to stop an "
+                    "idle session consuming compute units, or to force a clean "
+                    "machine; use restart_kernel if you only need to clear memory. "
+                    "Ask the user before calling this on a session holding work "
+                    "they have not saved. Returns {deleted, cancelled_pending, note}."
                 ),
             ),
             Tool.from_function(

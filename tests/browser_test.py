@@ -268,6 +268,53 @@ class TestRestartKernel:
         assert await ColabBrowser().restart_kernel() is False
 
 
+class TestDeleteRuntime:
+    @pytest.mark.asyncio
+    async def test_deletes_and_confirms(self, colab, page):
+        page.add(("text", "Runtime"))
+        page.add(("text", "Disconnect and delete runtime"))
+        page.add(("text", "Yes"))
+
+        assert await colab.delete_runtime() is True
+        assert ("click", ("text", "Disconnect and delete runtime")) in page.actions
+        assert ("click", ("text", "Yes")) in page.actions
+
+    @pytest.mark.asyncio
+    async def test_accepts_the_shorter_menu_wording(self, colab, page):
+        page.add(("text", "Runtime"))
+        page.add(("text", "Delete runtime"))
+
+        assert await colab.delete_runtime() is True
+        assert ("click", ("text", "Delete runtime")) in page.actions
+
+    @pytest.mark.asyncio
+    async def test_succeeds_when_no_confirmation_is_shown(self, colab, page):
+        # Colab skips the prompt when the runtime holds nothing worth losing.
+        page.add(("text", "Runtime"))
+        page.add(("text", "Disconnect and delete runtime"))
+
+        assert await colab.delete_runtime() is True
+
+    @pytest.mark.asyncio
+    async def test_reports_failure_when_the_entry_is_absent(self, colab, page):
+        page.add(("text", "Runtime"))
+        assert await colab.delete_runtime() is False
+
+    @pytest.mark.asyncio
+    async def test_does_not_settle_for_a_mere_restart(self, colab, page):
+        """Deleting must never silently degrade into restarting: the caller asked
+        for the VM to go away, and a restart would leave it running and billing."""
+        page.add(("text", "Runtime"))
+        page.add(("text", "Restart session"))
+
+        assert await colab.delete_runtime() is False
+        assert ("click", ("text", "Restart session")) not in page.actions
+
+    @pytest.mark.asyncio
+    async def test_no_page(self):
+        assert await ColabBrowser().delete_runtime() is False
+
+
 # --------------------------------------------------------------------------
 # save / export
 # --------------------------------------------------------------------------

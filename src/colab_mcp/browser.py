@@ -496,6 +496,36 @@ class ColabBrowser:
             logging.exception("colab-mcp: could not restart the kernel")
             return False
 
+    async def delete_runtime(self) -> bool:
+        """Runtime > Disconnect and delete runtime — tears down the whole VM.
+
+        Strictly more destructive than `restart_kernel`: that keeps the machine
+        and restarts the Python process on it, so files under /content survive.
+        This discards the VM itself, and with it every uploaded file, pip
+        install and mounted Drive. It is also the only way to stop a session
+        from burning compute units while idle, which is why it is worth a tool
+        of its own rather than leaving it to the UI.
+        """
+        if self.page is None:
+            return False
+        try:
+            # Colab has used both wordings; match the long one first so a
+            # substring search cannot land on a different Runtime entry.
+            for label in ("Disconnect and delete runtime", "Delete runtime"):
+                with contextlib.suppress(Exception):
+                    await self._runtime_menu(label, timeout_ms=3_000)
+                    break
+            else:
+                logging.warning("colab-mcp: no delete-runtime entry in the Runtime menu")
+                return False
+            # Colab asks "Do you want to disconnect and delete this runtime?"
+            # when there is state to lose, and deletes silently when there is not.
+            await self._confirm_dialog("Yes", "OK", "Delete")
+            return True
+        except Exception:  # noqa: BLE001
+            logging.exception("colab-mcp: could not delete the runtime")
+            return False
+
     async def _file_menu(self, item: str, timeout_ms: int = 10_000):
         """Open the File menu and return the menu item whose name contains `item`.
 

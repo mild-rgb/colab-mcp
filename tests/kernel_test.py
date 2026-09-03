@@ -68,6 +68,7 @@ def browser():
     b = Mock()
     b.interrupt_execution = AsyncMock(return_value=True)
     b.restart_kernel = AsyncMock(return_value=True)
+    b.delete_runtime = AsyncMock(return_value=True)
     b.save_notebook = AsyncMock(return_value=True)
     b.download_notebook = AsyncMock()
     return b
@@ -768,6 +769,36 @@ class TestRestartKernel:
     async def test_without_a_browser(self, frontend):
         tools = KernelTools(FakeProxyClient(frontend), browser=None)
         assert (await tools.restart_kernel())["restarted"] is False
+
+
+class TestDeleteRuntime:
+    @pytest.mark.asyncio
+    async def test_drops_pending_work_the_vm_can_never_report(
+        self, kernel_tools, frontend, browser
+    ):
+        frontend.run_delay = 0.4
+        execution = await kernel_tools.executions.launch(frontend.add("a"))
+
+        result = await kernel_tools.delete_runtime()
+
+        assert result["deleted"] is True
+        browser.delete_runtime.assert_awaited_once()
+        # Nothing may stay pending: the machine is gone, so a caller polling
+        # get_execution_status would otherwise wait on an id that never resolves.
+        assert execution.state == "interrupted"
+        await asyncio.gather(execution.task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_reports_the_menu_failure(self, kernel_tools, browser):
+        browser.delete_runtime = AsyncMock(return_value=False)
+        result = await kernel_tools.delete_runtime()
+        assert result["deleted"] is False
+        assert "runtime connected" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_without_a_browser(self, frontend):
+        tools = KernelTools(FakeProxyClient(frontend), browser=None)
+        assert (await tools.delete_runtime())["deleted"] is False
 
 
 # --------------------------------------------------------------------------

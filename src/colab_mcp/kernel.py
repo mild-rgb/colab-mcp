@@ -974,6 +974,29 @@ class KernelTools:
         restarted = await self.browser.restart_kernel()
         return {"restarted": bool(restarted)}
 
+    async def delete_runtime(self) -> dict:
+        """Disconnect and delete the runtime VM, not just the kernel process.
+
+        Everything tracked in-flight is dropped first: the VM is going away, so
+        any pending execution can never report back, and leaving those entries
+        would strand get_execution_status on ids that will never resolve.
+        """
+        if self.browser is None:
+            return {"deleted": False, "error": "no browser session"}
+        cancelled = self.executions.drop_pending()
+        self.executions.mark_interrupted()
+        deleted = await self.browser.delete_runtime()
+        return {
+            "deleted": bool(deleted),
+            "cancelled_pending": cancelled,
+            "note": (
+                "runtime VM deleted; kernel state and files under /content are gone. "
+                "The next execution starts a fresh runtime."
+                if deleted
+                else "could not find the delete-runtime entry; is a runtime connected?"
+            ),
+        }
+
     # -- file transfer -----------------------------------------------------
 
     async def export_notebook(
