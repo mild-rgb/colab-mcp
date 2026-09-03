@@ -10,8 +10,8 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "anyio>=4.5",
-    "fastmcp==2.14.5",
-    "mcp[cli]>=1.20.0",
+    "fastmcp>=2.14.5,<3",
+    "mcp[cli]>=1.20.0,<2",
     "pydantic>=2.12.3,<3.0.0",
     "websockets>=15.0.1",
     "playwright>=1.61.0",
@@ -27,11 +27,11 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "coverage>=7.13.1",
-    "fastmcp==2.14.5",
+    "fastmcp>=2.14.5,<3",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
-    "ruff>=0.14.3",
+    "ruff>=0.14.3,<0.15",
 ]
 commit = [
     "pre-commit>=4.3.0",
