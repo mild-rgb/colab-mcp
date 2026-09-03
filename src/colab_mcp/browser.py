@@ -33,8 +33,10 @@ import logging
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
+import time
 
 HOME = os.path.expanduser("~")
 CHROMIUM = os.environ.get("COLAB_MCP_CHROMIUM", "/snap/bin/chromium")
@@ -116,6 +118,80 @@ def _profile_email() -> str:
     return ""
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether `pid` is still a running process.
+
+    A zombie does not count: it has already exited and released its files and
+    locks, and only lingers in the table until its parent reaps it. Treating one
+    as alive would mean waiting out the whole timeout and then sending SIGKILL
+    to a process that is already dead.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            stat = handle.read().decode("utf-8", "replace")
+    except OSError:
+        # Either the process is gone, or there is no /proc to ask (non-Linux).
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    # The comm field is parenthesised and may itself contain spaces, so the
+    # state letter is the first field after the final ')'.
+    _, closed, rest = stat.rpartition(")")
+    if not closed:
+        return True
+    return rest.split()[0] != "Z" if rest.split() else True
+
+
+def _chrome_pids_using_profile(profile: str) -> list[int]:
+    """PIDs of browser processes holding `profile` as their user-data-dir.
+
+    Linux-only (reads /proc); returns [] anywhere else, so callers simply skip
+    the recovery rather than failing.
+    """
+    if not os.path.isdir("/proc"):
+        return []
+    needle = f"--user-data-dir={profile}"
+    pids: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                cmdline = handle.read().decode("utf-8", "replace")
+        except OSError:
+            continue  # exited between listdir and open, or not ours to read
+        # Chromium's helpers inherit the data dir but carry --type=; only the
+        # browser process holds the lock, and killing helpers achieves nothing.
+        if needle in cmdline and "--type=" not in cmdline:
+            pids.append(int(entry))
+    return pids
+
+
+def _terminate_pids(pids: list[int], timeout_s: float = 10.0) -> list[int]:
+    """SIGTERM the pids, escalating to SIGKILL only for what refuses to die.
+
+    Never lead with SIGKILL: Chrome flushes cookies to disk on SIGTERM, and
+    those cookies are the login this profile exists to keep. Returns the pids
+    that needed killing.
+    """
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not any(_pid_alive(pid) for pid in pids):
+            return []
+        time.sleep(0.2)
+    stubborn = [pid for pid in pids if _pid_alive(pid)]
+    for pid in stubborn:
+        logging.warning("colab-mcp: chromium pid=%s ignored SIGTERM; killing", pid)
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return stubborn
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -183,6 +259,20 @@ class ColabBrowser:
             # profile copy and process spawn both do blocking filesystem work
             await asyncio.to_thread(_sync_login_profile)
             self.port = _free_port()
+            # A previous server can die without closing its browser -- a hard
+            # kill skips close() entirely -- leaving a chromium still holding
+            # the profile. Chromium then hands our URL to that instance and
+            # exits, so CDP never comes up and the launch fails with nobody
+            # around to clear it. Reclaim the profile before spawning.
+            orphans = await asyncio.to_thread(_chrome_pids_using_profile, PW_PROFILE)
+            if orphans:
+                logging.warning(
+                    "colab-mcp: reclaiming profile %s from orphaned chromium %s",
+                    PW_PROFILE,
+                    orphans,
+                )
+                await asyncio.to_thread(_terminate_pids, orphans)
+
             with contextlib.suppress(FileNotFoundError):
                 os.remove(os.path.join(PW_PROFILE, "DevToolsActivePort"))
 
@@ -685,7 +775,23 @@ class ColabBrowser:
         with contextlib.suppress(Exception):
             if self._pw:
                 await self._pw.stop()
-        with contextlib.suppress(Exception):
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            # Wait for it to actually go. terminate() only asks; returning while
+            # chromium is still up leaves the profile locked, and the next
+            # server's launch then fails on a browser this one was meant to have
+            # closed.
+            try:
+                await asyncio.to_thread(proc.wait, 10)
+            except Exception:  # noqa: BLE001 -- TimeoutExpired, and anything else
+                logging.warning(
+                    "colab-mcp: chromium pid=%s ignored SIGTERM on shutdown; killing",
+                    proc.pid,
+                )
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(proc.wait, 5)
         self._browser = self._pw = self.page = self._proc = None

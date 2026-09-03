@@ -23,6 +23,7 @@ work — that is pinned below because it broke the export path once already.
 import asyncio
 import json
 import os
+import time
 
 import pytest
 
@@ -767,6 +768,90 @@ class TestSignedOutDetection:
     async def test_on_signin_page_is_not_signed_in(self, colab, page):
         page.url = "https://accounts.google.com/v3/signin/accountchooser"
         assert await colab.is_signed_in() is False
+
+
+class TestProfileReclaim:
+    """A server that dies without closing its browser strands a chromium on the
+    profile, and the next launch fails on a lock nobody is left to clear. These
+    use real processes: the bug was that terminate() was never waited on, which
+    a mock would have happily reported as working."""
+
+    @staticmethod
+    def _spawn(profile, *extra):
+        import subprocess
+        import sys
+
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)",
+             f"--user-data-dir={profile}", *extra]
+        )
+
+    def test_finds_the_process_holding_the_profile(self, tmp_path):
+        profile = str(tmp_path / "prof")
+        proc = self._spawn(profile)
+        try:
+            assert proc.pid in browser_mod._chrome_pids_using_profile(profile)
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def test_ignores_helper_processes(self, tmp_path):
+        """Only the browser process holds the lock; killing renderers is noise."""
+        profile = str(tmp_path / "prof")
+        proc = self._spawn(profile, "--type=renderer")
+        try:
+            assert proc.pid not in browser_mod._chrome_pids_using_profile(profile)
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def test_ignores_a_different_profile(self, tmp_path):
+        proc = self._spawn(str(tmp_path / "other"))
+        try:
+            assert browser_mod._chrome_pids_using_profile(str(tmp_path / "mine")) == []
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def test_terminate_stops_the_process(self, tmp_path):
+        proc = self._spawn(str(tmp_path / "prof"))
+        try:
+            assert browser_mod._terminate_pids([proc.pid], timeout_s=10) == []
+            assert not browser_mod._pid_alive(proc.pid) or proc.poll() is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+
+    def test_kills_what_ignores_sigterm(self, tmp_path):
+        """Chrome can decline SIGTERM. The profile still has to come free."""
+        import subprocess
+        import sys
+
+        profile = str(tmp_path / "prof")
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+             f"--user-data-dir={profile}"]
+        )
+        try:
+            # Give it a moment to install the handler before signalling.
+            time.sleep(0.5)
+            assert browser_mod._terminate_pids([proc.pid], timeout_s=1.5) == [proc.pid]
+            proc.wait(timeout=10)
+            assert proc.poll() is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+    def test_survives_a_pid_that_is_already_gone(self, tmp_path):
+        proc = self._spawn(str(tmp_path / "prof"))
+        pid = proc.pid
+        proc.kill()
+        proc.wait(timeout=10)
+        # Reaped mid-flight is the normal race, not an error.
+        assert browser_mod._terminate_pids([pid], timeout_s=1) == []
 
 
 class TestProfileSyncOptOut:
