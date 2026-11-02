@@ -104,6 +104,135 @@ DOWNLOAD_DIR = os.environ.get(
 )
 
 
+# Colab renders its modal prompts as top-level `<mwc-dialog open>` elements, and
+# an open one intercepts pointer events for the whole page: every menu click
+# after it times out in Playwright with "<mwc-dialog> intercepts pointer
+# events". The known offender is the `user-secrets-prompt` raised by a
+# `userdata.get()` on a secret the notebook has no access to -- it survives a
+# reload, stacks one instance per failed call, and is `inert`, so Playwright's
+# own locators cannot click inside it. We drive the buttons from JS instead,
+# and the buttons are `md-text-button`, not `mwc-button`.
+#
+# Dialogs whose class matches this pattern are never auto-dismissed: cancelling
+# the MCP bridge's own "Connect to a local Colab MCP server" prompt would cut
+# the connection this server exists to make. `click_connect` accepts it.
+PROTECTED_DIALOG_PATTERN = r"local-mcp-connect"
+
+# The "Notebook ... does not have access to secret named 'X'. Grant access?"
+# prompt from google.colab.userdata.get(). With COLAB_MCP_GRANT_SECRETS on
+# (the default) it is answered "Grant access" rather than cancelled, both when
+# a menu tool clears the page and from a background watcher that answers it
+# while the kernel is still waiting, so the userdata.get() call itself
+# succeeds. This hands the user's secrets to whatever notebook the agent is
+# driving; set COLAB_MCP_GRANT_SECRETS=0 to go back to cancelling.
+SECRETS_PROMPT_PATTERN = r"user-secrets-prompt"
+GRANT_SECRETS = os.environ.get("COLAB_MCP_GRANT_SECRETS", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# How often the watcher looks for a secrets prompt. Colab gives the prompt a
+# limited time before userdata.get() raises, so this stays short.
+SECRET_POLL_S = 1.0
+
+# Read-only: what is open right now.
+_SCAN_DIALOGS_JS = r"""
+(protectedPattern) => {
+  const protectedRe = protectedPattern ? new RegExp(protectedPattern, 'i') : null;
+  return [...document.querySelectorAll('mwc-dialog[open]')].map(d => ({
+    cls: d.className || '',
+    text: (d.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+    actions: [...d.querySelectorAll('[dialogaction]')].map(b => b.getAttribute('dialogaction')),
+    dismissed: false,
+    protected: !!(protectedRe && protectedRe.test(d.className || '')),
+  }));
+}
+"""
+
+# Close every open dialog except the protected ones. Dialogs matching `grant`
+# get their primary "ok" action (the secrets prompt's "Grant access"); every
+# other one is cancelled, the non-committing choice that deletes no runtime.
+# A dialog without a usable button is closed through the element's own API.
+_DISMISS_DIALOGS_JS = r"""
+({protected: protectedPattern, grant: grantPattern}) => {
+  const protectedRe = protectedPattern ? new RegExp(protectedPattern, 'i') : null;
+  const grantRe = grantPattern ? new RegExp(grantPattern, 'i') : null;
+  const out = [];
+  for (const d of document.querySelectorAll('mwc-dialog[open]')) {
+    const cls = d.className || '';
+    const entry = {
+      cls,
+      text: (d.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+      actions: [...d.querySelectorAll('[dialogaction]')].map(b => b.getAttribute('dialogaction')),
+      dismissed: false,
+      granted: false,
+      protected: !!(protectedRe && protectedRe.test(cls)),
+    };
+    if (!entry.protected) {
+      const ok = grantRe && grantRe.test(cls) ? d.querySelector('[dialogaction="ok"]') : null;
+      const cancel = d.querySelector('[dialogaction="cancel"], [dialogaction="close"]');
+      if (ok) {
+        ok.click();
+        entry.granted = true;
+      } else if (cancel) {
+        cancel.click();
+      } else if (typeof d.close === 'function') {
+        d.close();
+      } else {
+        d.removeAttribute('open');
+      }
+      entry.dismissed = true;
+    }
+    out.push(entry);
+  }
+  return out;
+}
+"""
+
+# The toolbar's connect button lives in the shadow root of
+# <colab-connect-button>. Its label is "Connect" (no runtime) or "Reconnect"
+# (had one, lost the connection) when nothing is attached, and the RAM/Disk
+# gauges when something is. Reading it costs nothing on the VM side, which is
+# the point: it lets us answer "is a runtime attached?" without running code,
+# and running code is exactly what provisions a new runtime.
+_CONNECT_LABEL_JS = r"""
+() => {
+  const host = document.querySelector('colab-connect-button');
+  const root = host && (host.shadowRoot || host);
+  const btn = root && root.querySelector('#connect');
+  if (!btn) return null;
+  return (btn.textContent || '').replace(/\s+/g, ' ').trim();
+}
+"""
+
+_SECRET_NAME_RE = re.compile(r"secret named '([^']+)'")
+
+
+class BlockingDialogError(RuntimeError):
+    """A Colab dialog is intercepting pointer events and could not be dismissed."""
+
+
+def _secret_names(dialogs: list[dict], granted: bool) -> list[str]:
+    names = []
+    for dialog in dialogs:
+        if bool(dialog.get("granted")) != granted:
+            continue
+        match = _SECRET_NAME_RE.search(dialog.get("text") or "")
+        if match and match.group(1) not in names:
+            names.append(match.group(1))
+    return names
+
+
+def pending_secrets(dialogs: list[dict]) -> list[str]:
+    """Secrets whose access prompt was seen but not granted."""
+    return _secret_names(dialogs, granted=False)
+
+
+def granted_secrets(dialogs: list[dict]) -> list[str]:
+    """Secrets whose access prompt was answered "Grant access"."""
+    return _secret_names(dialogs, granted=True)
+
+
 def _profile_email() -> str:
     """The signed-in account recorded in the source Chrome profile, if any."""
     if GOOGLE_EMAIL:
@@ -243,6 +372,7 @@ class ColabBrowser:
         self.page = None
         self.port: int | None = None
         self._lock = asyncio.Lock()
+        self._secret_watcher: asyncio.Task | None = None
 
     def is_open(self) -> bool:
         return self.page is not None and self._proc is not None and self._proc.poll() is None
@@ -318,6 +448,7 @@ class ColabBrowser:
 
             ctx = self._browser.contexts[0]
             self.page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            self.start_secret_watcher()
             return self.page
 
     async def navigate(self, url: str):
@@ -497,11 +628,147 @@ class ColabBrowser:
                 return True
         return False
 
+    # -- dialogs -----------------------------------------------------------
+
+    async def list_dialogs(self) -> list[dict]:
+        """The open Colab dialogs, without touching them."""
+        if self.page is None:
+            return []
+        try:
+            return list(await self.page.evaluate(_SCAN_DIALOGS_JS, PROTECTED_DIALOG_PATTERN))
+        except Exception:  # noqa: BLE001
+            logging.exception("colab-mcp: could not scan for open dialogs")
+            return []
+
+    async def dismiss_dialogs(self, grant_secrets: bool | None = None) -> list[dict]:
+        """Close every open Colab dialog except the MCP bridge's own prompt.
+
+        Secrets prompts are granted when `grant_secrets` is true (default:
+        COLAB_MCP_GRANT_SECRETS); everything else is cancelled. Returns what
+        was found, each entry flagged `dismissed`, `granted` or `protected`.
+        """
+        if self.page is None:
+            return []
+        if grant_secrets is None:
+            grant_secrets = GRANT_SECRETS
+        found = list(
+            await self.page.evaluate(
+                _DISMISS_DIALOGS_JS,
+                {
+                    "protected": PROTECTED_DIALOG_PATTERN,
+                    "grant": SECRETS_PROMPT_PATTERN if grant_secrets else "",
+                },
+            )
+        )
+        if any(d.get("dismissed") for d in found):
+            # Closing is animated; give the DOM a beat before anyone re-scans.
+            await _pause(0.5)
+        return found
+
+    async def grant_secret_prompts(self) -> list[dict]:
+        """Answer "Grant access" on any open secrets prompt, touching nothing else."""
+        if self.page is None:
+            return []
+        found = list(
+            await self.page.evaluate(
+                _DISMISS_DIALOGS_JS,
+                # Protect everything that is not a secrets prompt.
+                {"protected": f"^(?!.*{SECRETS_PROMPT_PATTERN})", "grant": SECRETS_PROMPT_PATTERN},
+            )
+        )
+        return [d for d in found if d.get("granted")]
+
+    def start_secret_watcher(self) -> None:
+        """Answer secrets prompts in the background while the page is open.
+
+        The prompt appears while the kernel's userdata.get() is blocked on it
+        and Colab gives it only a short while before raising, so a click made
+        later by a menu tool would be too late for the call that asked. The
+        watcher answers within a second, so the call succeeds and nothing is
+        left on the page to block a menu.
+        """
+        if not GRANT_SECRETS or self.page is None:
+            return
+        if self._secret_watcher is not None and not self._secret_watcher.done():
+            return
+        self._secret_watcher = asyncio.create_task(self._watch_secret_prompts())
+
+    async def _watch_secret_prompts(self) -> None:
+        while self.page is not None:
+            try:
+                granted = await self.grant_secret_prompts()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- mid-navigation, page closed, ...
+                granted = []
+            for name in granted_secrets(granted):
+                logging.info("colab-mcp: granted the notebook access to secret %r", name)
+            await asyncio.sleep(SECRET_POLL_S)
+
+    async def _clear_blocking_dialogs(self) -> None:
+        """Make sure nothing modal is in the way before driving a menu.
+
+        Raises BlockingDialogError when a dialog will not go away, so the
+        caller reports the real obstacle instead of a Playwright timeout that
+        reads like a missing menu entry.
+        """
+        if self.page is None:
+            return
+        for _ in range(3):
+            found = await self.dismiss_dialogs()
+            blocking = [d for d in found if not d.get("protected")]
+            if not blocking:
+                return
+            logging.warning(
+                "colab-mcp: cleared %d blocking Colab dialog(s): %s",
+                len(blocking),
+                [
+                    ("granted: " if d.get("granted") else "cancelled: ")
+                    + d.get("text", "")[:120]
+                    for d in blocking
+                ],
+            )
+        still = [d for d in await self.list_dialogs() if not d.get("protected")]
+        if still:
+            raise BlockingDialogError(
+                "a Colab dialog is blocking the page and could not be dismissed: "
+                + "; ".join(d.get("text", "")[:160] for d in still)
+            )
+
+    async def _close_menu(self) -> None:
+        """Escape out of an open menu so it does not shadow the next click."""
+        with contextlib.suppress(Exception):
+            await self.page.keyboard.press("Escape")
+
+    async def runtime_attached(self) -> bool | None:
+        """Whether the notebook is attached to a runtime, read off the toolbar.
+
+        True when the RAM/Disk gauges are showing, False when the button reads
+        "Connect"/"Reconnect", None when the state cannot be read (no page,
+        the toolbar has not rendered, or Colab is mid-allocation).
+        """
+        if self.page is None:
+            return None
+        try:
+            label = await self.page.evaluate(_CONNECT_LABEL_JS)
+        except Exception:  # noqa: BLE001
+            return None
+        if not label:
+            return None
+        if re.match(r"(Re)?connect(\s|$)", label, re.IGNORECASE):
+            return False
+        if re.search(r"\b(RAM|Disk|Busy)\b", label, re.IGNORECASE):
+            return True
+        return None
+
+    # -- menus -------------------------------------------------------------
+
     async def set_runtime_accelerator(self, accelerator: str = "T4 GPU") -> str:
         """Automate Runtime -> Change runtime type -> <accelerator> -> Save."""
         if self.page is None:
             return "browser not open"
         p = self.page
+        await self._clear_blocking_dialogs()
         # Locator clicks auto-wait for the target to be visible and actionable,
         # so no fixed sleeps are needed between menu steps.
         await p.get_by_text("Runtime", exact=True).first.click()
@@ -522,16 +789,36 @@ class ColabBrowser:
             await save.wait_for(state="hidden", timeout=10_000)
         return f"requested runtime accelerator: {accelerator}"
 
+    async def _open_runtime_menu(self) -> None:
+        """Open the Runtime menu, raising with the real cause when it cannot be.
+
+        The cause matters: a dialog intercepting pointer events and a menu
+        entry that is genuinely absent used to produce the same "could not
+        find the entry" report, which sent callers debugging runtime
+        connectivity for what was a stuck DOM overlay.
+        """
+        await self._clear_blocking_dialogs()
+        await self.page.get_by_text("Runtime", exact=True).first.click()
+
+    async def _click_menu_entry(self, item: str, timeout_ms: int) -> bool:
+        """Click the open menu's entry whose text contains `item`, if it shows up."""
+        entry = self.page.get_by_text(item, exact=False).first
+        try:
+            await entry.wait_for(state="visible", timeout=timeout_ms)
+        except Exception:  # noqa: BLE001 -- Playwright timeout: the entry is not there
+            return False
+        await entry.click()
+        return True
+
     async def _runtime_menu(self, item: str, timeout_ms: int = 10_000) -> bool:
         """Open the Runtime menu and click the entry whose text contains `item`."""
         if self.page is None:
             return False
-        p = self.page
-        await p.get_by_text("Runtime", exact=True).first.click()
-        entry = p.get_by_text(item, exact=False).first
-        await entry.wait_for(state="visible", timeout=timeout_ms)
-        await entry.click()
-        return True
+        await self._open_runtime_menu()
+        if await self._click_menu_entry(item, timeout_ms):
+            return True
+        await self._close_menu()
+        raise LookupError(f"no {item!r} entry in the Runtime menu")
 
     async def _confirm_dialog(self, *labels: str, timeout_ms: int = 3_000) -> bool:
         """Click the first of `labels` that shows up in a confirmation dialog."""
@@ -568,23 +855,27 @@ class ColabBrowser:
             return False
 
     async def restart_kernel(self) -> bool:
-        """Runtime > Restart session, confirming the prompt if one appears."""
+        """Runtime > Restart session, confirming the prompt if one appears.
+
+        Returns False only when the menu opened and had no restart entry.
+        Anything that stops the menu from being driven at all -- a blocking
+        dialog, a page that never rendered -- is raised, so the caller can
+        report the real cause rather than a guess.
+        """
         if self.page is None:
             return False
-        try:
-            # Colab has renamed this over time; match either wording, and avoid
-            # "Restart and run all" / "Disconnect and delete runtime".
-            for label in ("Restart session", "Restart runtime"):
-                with contextlib.suppress(Exception):
-                    await self._runtime_menu(label, timeout_ms=3_000)
-                    break
-            else:
-                return False
-            await self._confirm_dialog("Yes", "OK", "Restart")
-            return True
-        except Exception:  # noqa: BLE001
-            logging.exception("colab-mcp: could not restart the kernel")
+        await self._open_runtime_menu()
+        # Colab has renamed this over time; match either wording, and avoid
+        # "Restart and run all" / "Disconnect and delete runtime".
+        for label in ("Restart session", "Restart runtime"):
+            if await self._click_menu_entry(label, timeout_ms=3_000):
+                break
+        else:
+            logging.warning("colab-mcp: no restart entry in the Runtime menu")
+            await self._close_menu()
             return False
+        await self._confirm_dialog("Yes", "OK", "Restart")
+        return True
 
     async def delete_runtime(self) -> bool:
         """Runtime > Disconnect and delete runtime — tears down the whole VM.
@@ -595,26 +886,29 @@ class ColabBrowser:
         install and mounted Drive. It is also the only way to stop a session
         from burning compute units while idle, which is why it is worth a tool
         of its own rather than leaving it to the UI.
+
+        Returns False only when the Runtime menu opened and had no delete
+        entry, which is what "no runtime connected" actually looks like. A
+        menu that cannot be driven at all raises instead: swallowing that
+        once turned a stuck secrets dialog into a "is a runtime connected?"
+        report while the runtime sat there billing.
         """
         if self.page is None:
             return False
-        try:
-            # Colab has used both wordings; match the long one first so a
-            # substring search cannot land on a different Runtime entry.
-            for label in ("Disconnect and delete runtime", "Delete runtime"):
-                with contextlib.suppress(Exception):
-                    await self._runtime_menu(label, timeout_ms=3_000)
-                    break
-            else:
-                logging.warning("colab-mcp: no delete-runtime entry in the Runtime menu")
-                return False
-            # Colab asks "Do you want to disconnect and delete this runtime?"
-            # when there is state to lose, and deletes silently when there is not.
-            await self._confirm_dialog("Yes", "OK", "Delete")
-            return True
-        except Exception:  # noqa: BLE001
-            logging.exception("colab-mcp: could not delete the runtime")
+        await self._open_runtime_menu()
+        # Colab has used both wordings; match the long one first so a
+        # substring search cannot land on a different Runtime entry.
+        for label in ("Disconnect and delete runtime", "Delete runtime"):
+            if await self._click_menu_entry(label, timeout_ms=3_000):
+                break
+        else:
+            logging.warning("colab-mcp: no delete-runtime entry in the Runtime menu")
+            await self._close_menu()
             return False
+        # Colab asks "Do you want to disconnect and delete this runtime?"
+        # when there is state to lose, and deletes silently when there is not.
+        await self._confirm_dialog("Yes", "OK", "Delete")
+        return True
 
     async def _file_menu(self, item: str, timeout_ms: int = 10_000):
         """Open the File menu and return the menu item whose name contains `item`.
@@ -624,6 +918,7 @@ class ColabBrowser:
         accessible name substring rather than exact text.
         """
         p = self.page
+        await self._clear_blocking_dialogs()
         await p.get_by_text("File", exact=True).first.click()
         entry = p.get_by_role("menuitem", name=item).first
         await entry.wait_for(state="visible", timeout=timeout_ms)
@@ -769,6 +1064,11 @@ class ColabBrowser:
         return path
 
     async def close(self) -> None:
+        watcher, self._secret_watcher = self._secret_watcher, None
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+            with contextlib.suppress(BaseException):
+                await watcher
         with contextlib.suppress(Exception):
             if self._browser:
                 await self._browser.close()

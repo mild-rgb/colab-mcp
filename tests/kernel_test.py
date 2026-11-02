@@ -52,6 +52,8 @@ from fake_frontend import (
 )
 from unittest.mock import AsyncMock, Mock
 
+from colab_mcp import browser as kernel_browser
+
 
 @pytest.fixture
 def frontend():
@@ -69,6 +71,7 @@ def browser():
     b.interrupt_execution = AsyncMock(return_value=True)
     b.restart_kernel = AsyncMock(return_value=True)
     b.delete_runtime = AsyncMock(return_value=True)
+    b.runtime_attached = AsyncMock(return_value=None)
     b.save_notebook = AsyncMock(return_value=True)
     b.download_notebook = AsyncMock()
     return b
@@ -593,6 +596,74 @@ class TestRuntimeInfo:
         info = await kernel_tools.runtime_info()
         assert info["gpu_name"] == "Tesla T4"
         assert info["connected"] is True
+        assert info["runtime_attached"] is True
+
+    @pytest.mark.asyncio
+    async def test_does_not_provision_a_runtime_it_just_deleted(
+        self, kernel_tools, frontend
+    ):
+        """runtime_info reads as a status check, so it must not run a cell on
+        a notebook with no runtime: that allocates hardware and restarts billing."""
+        runs = []
+        frontend.runner = lambda code: runs.append(code) or [
+            stream_output(kernel.PAYLOAD_BEGIN + '{"accelerator": "GPU"}' + kernel.PAYLOAD_END)
+        ]
+        await kernel_tools.delete_runtime()
+
+        info = await kernel_tools.runtime_info()
+
+        assert info["runtime_attached"] is False
+        assert "no VM was started" in info["note"]
+        assert runs == []  # nothing executed, so nothing was provisioned
+
+    @pytest.mark.asyncio
+    async def test_the_next_execution_clears_the_deleted_state(
+        self, kernel_tools, frontend
+    ):
+        frontend.runner = _payload_runner(
+            [{"ok": 1}, {"accelerator": "GPU", "gpu_name": "A100"}]
+        )
+        await kernel_tools.delete_runtime()
+        # The caller chose to run code, which is what starts a fresh runtime.
+        await kernel_tools.execute_transient("1")
+
+        info = await kernel_tools.runtime_info()
+        assert info["runtime_attached"] is True
+        assert info["gpu_name"] == "A100"
+
+    @pytest.mark.asyncio
+    async def test_the_toolbar_says_nothing_is_attached(
+        self, kernel_tools, frontend, browser
+    ):
+        browser.runtime_attached = AsyncMock(return_value=False)
+        runs = []
+        frontend.runner = lambda code: runs.append(code) or [
+            stream_output(kernel.PAYLOAD_BEGIN + '{"accelerator": "GPU"}' + kernel.PAYLOAD_END)
+        ]
+
+        info = await kernel_tools.runtime_info()
+
+        assert info["runtime_attached"] is False
+        assert runs == []
+
+    @pytest.mark.asyncio
+    async def test_the_toolbar_overrides_a_stale_deleted_flag(
+        self, kernel_tools, frontend, browser
+    ):
+        """The user may have reconnected from the UI after our delete."""
+        await kernel_tools.delete_runtime()
+        browser.runtime_attached = AsyncMock(return_value=True)
+        frontend.runner = _payload_runner([{"accelerator": "GPU", "gpu_name": "L4"}])
+
+        info = await kernel_tools.runtime_info()
+
+        assert info["gpu_name"] == "L4"
+        assert info["runtime_attached"] is True
+
+    @pytest.mark.asyncio
+    async def test_without_a_browser_the_flag_alone_decides(self, frontend):
+        tools = KernelTools(FakeProxyClient(frontend), browser=None)
+        assert await tools.runtime_attached() is None
 
 
 class TestGetCellOutput:
@@ -794,6 +865,46 @@ class TestDeleteRuntime:
         result = await kernel_tools.delete_runtime()
         assert result["deleted"] is False
         assert "runtime connected" in result["note"]
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_reports_the_real_cause_when_the_menu_is_blocked(
+        self, kernel_tools, browser
+    ):
+        """An overlay intercepting clicks must not be reported as a missing
+        menu entry: that sent a caller debugging connectivity while the VM
+        they were trying to stop kept billing."""
+        browser.delete_runtime = AsyncMock(
+            side_effect=TimeoutError(
+                "Locator.click: Timeout 30000ms exceeded.\n"
+                "Call log:\n"
+                "  - waiting for get_by_text(\"Runtime\", exact=True).first\n"
+                "  - <mwc-dialog open=\"\" class=\"user-secrets-prompt\">…</mwc-dialog> "
+                "intercepts pointer events\n"
+                "  - retrying click action\n"
+            )
+        )
+
+        result = await kernel_tools.delete_runtime()
+
+        assert result["deleted"] is False
+        assert "user-secrets-prompt" in result["error"]
+        assert "intercepts pointer events" in result["error"]
+        assert "retrying click action" not in result["error"]
+        assert "runtime connected" not in result["note"]
+        assert "NOT deleted" in result["note"]
+        assert "dismiss_colab_dialog" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_restart_is_reported_the_same_way(
+        self, kernel_tools, browser
+    ):
+        browser.restart_kernel = AsyncMock(
+            side_effect=kernel_browser.BlockingDialogError("a Colab dialog is blocking")
+        )
+        result = await kernel_tools.restart_kernel()
+        assert result["restarted"] is False
+        assert "BlockingDialogError" in result["error"]
 
     @pytest.mark.asyncio
     async def test_without_a_browser(self, frontend):
@@ -976,6 +1087,33 @@ class TestFileTransfer:
         frontend.runner = _payload_runner([{"size": kernel.MAX_TRANSFER_BYTES + 1}])
         result = await kernel_tools.download_file("/big", str(tmp_path / "out.bin"))
         assert "limit is" in result["error"]
+        assert "COLAB_MCP_MAX_TRANSFER_BYTES" in result["error"]
+
+    def test_the_default_ceiling_fits_an_activation_dump(self):
+        """256 MB refused a single .npy of features; the transport was never
+        the limit, only this guard was."""
+        assert kernel.MAX_TRANSFER_BYTES >= 8 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_a_file_over_the_old_256mb_cap_is_accepted(
+        self, kernel_tools, frontend, tmp_path, monkeypatch
+    ):
+        import base64
+
+        # A "412 MB" file, at a chunk size that keeps the test to three cells.
+        size = 412_876_928
+        monkeypatch.setattr(kernel, "FILE_CHUNK_BYTES", size // 2 + 1)
+        chunks = [b"a" * (size // 2 + 1), b"b" * (size - (size // 2 + 1))]
+        frontend.runner = _payload_runner(
+            [{"size": size}] + [{"b64": base64.b64encode(c).decode()} for c in chunks]
+        )
+        dest = tmp_path / "X_005.npy"
+
+        result = await kernel_tools.download_file("/content/features/X_005.npy", str(dest))
+
+        assert "error" not in result
+        assert result["bytes"] == size
+        assert dest.stat().st_size == size
 
     @pytest.mark.asyncio
     async def test_upload_sends_every_chunk(

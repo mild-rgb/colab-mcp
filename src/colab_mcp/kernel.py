@@ -58,8 +58,17 @@ _PAYLOAD_RE = re.compile(
 # cell's stdout and travels over the websocket bridge; it never enters the
 # agent's context, so the limit is about frontend/websocket comfort, not tokens.
 FILE_CHUNK_BYTES = 256 * 1024
-# Refuse absurd transfers rather than spending an hour on them silently.
-MAX_TRANSFER_BYTES = 256 * 1024 * 1024
+# Ceiling on a single transfer. The transport is chunked, so this is not a
+# transport limit: it exists to refuse a transfer nobody meant to start before
+# it spends hours of transient cells. The old 256 MB default was well under a
+# single activation dump, which forced splitting files on the VM by hand;
+# override with COLAB_MCP_MAX_TRANSFER_BYTES when the default is still wrong.
+MAX_TRANSFER_BYTES = int(
+    os.environ.get("COLAB_MCP_MAX_TRANSFER_BYTES", "") or 8 * 1024 * 1024 * 1024
+)
+# Log transfer progress every this many chunks (16 MB at the default chunk
+# size), so a multi-gigabyte copy is visibly alive in the server log.
+_TRANSFER_LOG_EVERY = 64
 
 DEFAULT_TRANSIENT_TIMEOUT = 120.0
 # A cell run we launched but never saw finish stays pollable this long before
@@ -68,9 +77,48 @@ EXECUTION_RETENTION = 60 * 60.0
 
 TERMINAL_STATES = ("done", "error", "interrupted", "timeout")
 
+_MENU_FAILURE_NOTE = (
+    "The Colab Runtime menu could not be driven. If the error names a dialog "
+    "intercepting pointer events, call dismiss_colab_dialog and retry; "
+    "screenshot_colab shows what is on screen."
+)
+
 
 class NotConnectedError(RuntimeError):
     """Raised when a kernel operation needs the Colab frontend and it is absent."""
+
+
+def _too_large(path: str, size: int) -> str:
+    return (
+        f"{path} is {size} bytes; limit is {MAX_TRANSFER_BYTES} "
+        f"({MAX_TRANSFER_BYTES // (1024 * 1024)} MB). The transfer is chunked, so the "
+        "limit only guards against unintended multi-hour copies: raise it with "
+        "COLAB_MCP_MAX_TRANSFER_BYTES in the server's environment."
+    )
+
+
+def _log_progress(direction: str, path: str, done: int, total: int) -> None:
+    chunk_index = (done + FILE_CHUNK_BYTES - 1) // FILE_CHUNK_BYTES
+    if done >= total or chunk_index % _TRANSFER_LOG_EVERY == 0:
+        logging.info(
+            "colab-mcp: %s %s: %d / %d bytes (%.0f%%)",
+            direction, path, done, total, 100.0 * done / total if total else 100.0,
+        )
+
+
+def describe_error(exc: BaseException, limit: int = 400) -> str:
+    """A one-paragraph account of `exc` fit for a tool result.
+
+    Playwright's timeouts run to dozens of lines of call log; the useful part
+    is the first line plus whichever line names the element that intercepted
+    the click, so those are what survive.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    keep = lines[:1] + [
+        line for line in lines[1:] if "intercepts pointer events" in line
+    ]
+    text = f"{type(exc).__name__}: " + " | ".join(keep) if keep else type(exc).__name__
+    return text[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -708,10 +756,15 @@ class KernelTools:
         self.tools = ProxyTools(proxy_client)
         self.executions = ExecutionManager(self.tools)
         self.browser = browser
+        # Set by a successful delete_runtime and cleared by the next execution:
+        # while it holds, anything that would run code on the VM must know it
+        # is about to provision a fresh runtime, not inspect the old one.
+        self._runtime_deleted = False
 
     # -- execution ---------------------------------------------------------
 
     async def run_cell_async(self, cell_id: Any) -> dict:
+        self._runtime_deleted = False
         execution = await self.executions.launch(cell_id)
         return execution.summary()
 
@@ -725,6 +778,7 @@ class KernelTools:
         one call instead of six, and it stops at the first failure by default so
         the tail of the list does not run against a broken state.
         """
+        self._runtime_deleted = False
         results = []
         for cell_id in cell_ids:
             entry: dict[str, Any] = {"cellId": cell_id}
@@ -765,6 +819,7 @@ class KernelTools:
         only way to reach the kernel is through a cell. So: add, run, read,
         delete. The delete runs even when the code raises or times out.
         """
+        self._runtime_deleted = False
         cell_id = await self.tools.add_code_cell(code)
         timed_out = False
         error: str | None = None
@@ -821,7 +876,44 @@ class KernelTools:
         )
         return await self._run_payload(code, timeout_s)
 
+    async def runtime_attached(self) -> bool | None:
+        """Whether a runtime is attached, without running code to find out.
+
+        The browser's toolbar is the authority when it can be read; otherwise
+        the memory of our own delete_runtime stands until something executes.
+        None means genuinely unknown.
+        """
+        probe = None
+        if self.browser is not None:
+            with contextlib.suppress(Exception):
+                probe = await self.browser.runtime_attached()
+        if probe is True or probe is False:
+            # Trust the live UI over our memory in both directions: the user
+            # may have reconnected by hand, or disconnected from the toolbar.
+            self._runtime_deleted = not probe
+            return probe
+        if self._runtime_deleted:
+            return False
+        return None
+
     async def runtime_info(self, timeout_s: float = 60.0) -> dict:
+        """Hardware and resource state of the attached runtime.
+
+        This reads as a status check, so it must behave like one: probing the
+        VM means running a cell, and running a cell on a notebook with no
+        runtime attached provisions a new one and restarts billing. When we
+        know nothing is attached, say so instead.
+        """
+        if await self.runtime_attached() is False:
+            return {
+                "connected": self.tools.is_connected(),
+                "runtime_attached": False,
+                "note": (
+                    "no runtime is attached to this notebook, so nothing was "
+                    "probed and no VM was started. Running code (execute_transient, "
+                    "run_cells, upload_file, ...) will provision a fresh runtime."
+                ),
+            }
         info = await self._run_payload(
             _RUNTIME_INFO_TEMPLATE.format(
                 begin=json.dumps(PAYLOAD_BEGIN), end=json.dumps(PAYLOAD_END)
@@ -829,6 +921,7 @@ class KernelTools:
             timeout_s,
         )
         info["connected"] = self.tools.is_connected()
+        info["runtime_attached"] = True
         return info
 
     # -- inspection --------------------------------------------------------
@@ -971,7 +1064,15 @@ class KernelTools:
             return {"restarted": False, "error": "no browser session"}
         self.executions.drop_pending()
         self.executions.mark_interrupted()
-        restarted = await self.browser.restart_kernel()
+        try:
+            restarted = await self.browser.restart_kernel()
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("colab-mcp: could not drive the Runtime menu to restart")
+            return {
+                "restarted": False,
+                "error": describe_error(exc),
+                "note": _MENU_FAILURE_NOTE,
+            }
         return {"restarted": bool(restarted)}
 
     async def delete_runtime(self) -> dict:
@@ -985,7 +1086,24 @@ class KernelTools:
             return {"deleted": False, "error": "no browser session"}
         cancelled = self.executions.drop_pending()
         self.executions.mark_interrupted()
-        deleted = await self.browser.delete_runtime()
+        try:
+            deleted = await self.browser.delete_runtime()
+        except Exception as exc:  # noqa: BLE001
+            # Never fold this into "is a runtime connected?": the menu was
+            # unreachable, the runtime is most likely still up and billing,
+            # and the caller needs the real obstacle to clear it.
+            logging.exception("colab-mcp: could not drive the Runtime menu to delete")
+            return {
+                "deleted": False,
+                "cancelled_pending": cancelled,
+                "error": describe_error(exc),
+                "note": (
+                    "the runtime was NOT deleted and may still be running and "
+                    "billing. " + _MENU_FAILURE_NOTE
+                ),
+            }
+        if deleted:
+            self._runtime_deleted = True
         return {
             "deleted": bool(deleted),
             "cancelled_pending": cancelled,
@@ -993,7 +1111,8 @@ class KernelTools:
                 "runtime VM deleted; kernel state and files under /content are gone. "
                 "The next execution starts a fresh runtime."
                 if deleted
-                else "could not find the delete-runtime entry; is a runtime connected?"
+                else "the Runtime menu opened but had no delete-runtime entry; "
+                "is a runtime connected?"
             ),
         }
 
@@ -1050,7 +1169,7 @@ class KernelTools:
             return {"error": meta["error"]}
         size = int(meta["size"])
         if size > MAX_TRANSFER_BYTES:
-            return {"error": f"{remote_path} is {size} bytes; limit is {MAX_TRANSFER_BYTES}"}
+            return {"error": _too_large(remote_path, size)}
 
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)) or ".", exist_ok=True)
         written = 0
@@ -1069,13 +1188,14 @@ class KernelTools:
                 data = base64.b64decode(chunk["b64"])
                 handle.write(data)
                 written += len(data)
+                _log_progress("download", remote_path, written, size)
         return {"path": dest_path, "bytes": written, "remote_bytes": size}
 
     async def upload_file(self, src_path: str, remote_path: str) -> dict:
         """Copy a local file onto the Colab VM, in chunks via the kernel."""
         size = os.path.getsize(src_path)
         if size > MAX_TRANSFER_BYTES:
-            return {"error": f"{src_path} is {size} bytes; limit is {MAX_TRANSFER_BYTES}"}
+            return {"error": _too_large(src_path, size)}
 
         sent = 0
         with open(src_path, "rb") as handle:
@@ -1096,6 +1216,7 @@ class KernelTools:
                 )
                 sent += len(chunk)
                 first = False
+                _log_progress("upload", remote_path, sent, size)
                 if not chunk:
                     break
         return {"remote_path": remote_path, "bytes": sent}

@@ -595,6 +595,7 @@ class TestKernelToolWiring:
         session.OPEN_NOTEBOOK_TOOL_NAME,
         "set_gpu_runtime",
         "screenshot_colab",
+        "dismiss_colab_dialog",
     ]
 
     def _names(self):
@@ -680,6 +681,76 @@ class TestKernelToolWiring:
         assert called_args == args
         for key, value in expected.items():
             assert called_kwargs[key] == value
+
+
+class TestDismissColabDialog:
+    """The escape hatch for a dialog the agent did not expect. Without one, a
+    stuck secrets prompt could only be cleared by attaching a second Playwright
+    client to the browser's CDP port by hand."""
+
+    SECRETS = {
+        "cls": "user-secrets-prompt",
+        "text": "Notebook titled 'x.ipynb' does not have access to secret named 'HF_TOKEN'. Grant access?",
+        "actions": ["cancel", "ok"],
+        "dismissed": True,
+        "granted": True,
+        "protected": False,
+    }
+
+    def _proxy(self):
+        browser = Mock()
+        browser.page = object()
+        browser.dismiss_dialogs = AsyncMock(return_value=[dict(self.SECRETS)])
+        browser.list_dialogs = AsyncMock(
+            return_value=[dict(self.SECRETS, dismissed=False, granted=False)]
+        )
+        return session.ColabSessionProxy(browser=browser), browser
+
+    @pytest.mark.asyncio
+    async def test_dismisses_by_default_and_names_the_granted_secret(self):
+        proxy, browser = self._proxy()
+        result = await _get_injected_tool_fn(proxy, "dismiss_colab_dialog")()
+        browser.dismiss_dialogs.assert_awaited_once_with(grant_secrets=None)
+        assert result["granted_secrets"] == ["HF_TOKEN"]
+        assert result["pending_secrets"] == []
+        assert result["dismissed"] == [self.SECRETS["text"]]
+
+    @pytest.mark.asyncio
+    async def test_grant_secrets_false_is_passed_through(self):
+        proxy, browser = self._proxy()
+        browser.dismiss_dialogs = AsyncMock(
+            return_value=[dict(self.SECRETS, granted=False)]
+        )
+        result = await _get_injected_tool_fn(proxy, "dismiss_colab_dialog")(
+            grant_secrets=False
+        )
+        browser.dismiss_dialogs.assert_awaited_once_with(grant_secrets=False)
+        assert result["pending_secrets"] == ["HF_TOKEN"]
+        assert result["granted_secrets"] == []
+
+    @pytest.mark.asyncio
+    async def test_dismiss_false_only_looks(self):
+        proxy, browser = self._proxy()
+        result = await _get_injected_tool_fn(proxy, "dismiss_colab_dialog")(dismiss=False)
+        browser.dismiss_dialogs.assert_not_awaited()
+        browser.list_dialogs.assert_awaited_once()
+        assert result["dismissed"] == []
+        assert result["pending_secrets"] == ["HF_TOKEN"]
+
+    @pytest.mark.asyncio
+    async def test_without_a_browser_page(self):
+        browser = Mock()
+        browser.page = None
+        proxy = session.ColabSessionProxy(browser=browser)
+        result = await _get_injected_tool_fn(proxy, "dismiss_colab_dialog")()
+        assert "browser not open" in result["error"]
+
+    def test_transfer_descriptions_state_the_cap(self):
+        proxy = session.ColabSessionProxy(browser=Mock())
+        by_name = {t.name: t.description for t in proxy._make_injected_tools()}
+        for name in ("download_file", "upload_file"):
+            assert "COLAB_MCP_MAX_TRANSFER_BYTES" in by_name[name]
+            assert f"{session.kernel_max_transfer_mb()} MB" in by_name[name]
 
 
 class TestImportNotebook:

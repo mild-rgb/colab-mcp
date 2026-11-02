@@ -63,6 +63,9 @@ class FakeLocator:
 
     async def click(self, **kwargs):
         self.page.actions.append(("click", self.key))
+        error = self.page.click_errors.get(self.key)
+        if error is not None:
+            raise error
         handler = self.page.on_click.get(self.key)
         if handler:
             handler()
@@ -154,10 +157,63 @@ class FakePage:
         self.locators = {}
         self.on_click = {}
         self.on_hover = {}
+        # Exceptions a click on the keyed locator should raise, e.g. the
+        # Playwright timeout an overlay intercepting pointer events produces.
+        self.click_errors = {}
         self.chooser_files = None
         self.file_chooser_sets_url = None
         self.keyboard = FakeKeyboard(self)
         self.context = FakeContext(self)
+        # Open <mwc-dialog> elements, as the dialog JS would report them.
+        # A dialog listed in `sticky_dialogs` ignores its cancel click.
+        self.dialogs = []
+        self.sticky_dialogs = set()
+        # Text of the toolbar's connect button; None when it has not rendered.
+        self.connect_label = None
+        self.evaluate_calls = []
+
+    async def evaluate(self, script, arg=None):
+        self.evaluate_calls.append((script, arg))
+        import re as _re
+
+        if isinstance(arg, dict):
+            protected = _re.compile(arg["protected"], _re.I) if arg["protected"] else None
+            grant = _re.compile(arg["grant"], _re.I) if arg["grant"] else None
+        else:
+            protected = _re.compile(arg, _re.I) if arg else None
+            grant = None
+        if script is browser_mod._SCAN_DIALOGS_JS:
+            return [
+                dict(
+                    d,
+                    dismissed=False,
+                    protected=bool(protected and protected.search(d.get("cls", ""))),
+                )
+                for d in self.dialogs
+            ]
+        if script is browser_mod._DISMISS_DIALOGS_JS:
+            out, remaining = [], []
+            for d in self.dialogs:
+                entry = dict(d, dismissed=False, granted=False, protected=False)
+                cls = d.get("cls", "")
+                if protected and protected.search(cls):
+                    entry["protected"] = True
+                    remaining.append(d)
+                else:
+                    entry["dismissed"] = True
+                    if grant and grant.search(cls) and "ok" in d.get("actions", []):
+                        entry["granted"] = True
+                        self.actions.append(("grant", cls))
+                    else:
+                        self.actions.append(("dismiss", cls))
+                    if cls in self.sticky_dialogs:
+                        remaining.append(d)
+                out.append(entry)
+            self.dialogs = remaining
+            return out
+        if script is browser_mod._CONNECT_LABEL_JS:
+            return self.connect_label
+        raise AssertionError(f"unexpected evaluate: {script[:40]!r}")
 
     def expect_file_chooser(self, timeout=None):
         return FakeFileChooserContext(self)
@@ -314,6 +370,268 @@ class TestDeleteRuntime:
     @pytest.mark.asyncio
     async def test_no_page(self):
         assert await ColabBrowser().delete_runtime() is False
+
+    @pytest.mark.asyncio
+    async def test_raises_when_the_menu_cannot_be_driven(self, colab, page):
+        """A menu that will not open is not the same as an absent entry. The
+        old code swallowed both into False, and the kernel layer then reported
+        "is a runtime connected?" for what was a stuck dialog."""
+        page.add(("text", "Runtime"))
+        page.click_errors[("text", "Runtime")] = TimeoutError(
+            "Locator.click: Timeout 30000ms exceeded. <mwc-dialog open> "
+            "intercepts pointer events"
+        )
+        with pytest.raises(TimeoutError, match="intercepts pointer events"):
+            await colab.delete_runtime()
+
+    @pytest.mark.asyncio
+    async def test_closes_the_menu_when_the_entry_is_absent(self, colab, page):
+        page.add(("text", "Runtime"))
+        assert await colab.delete_runtime() is False
+        assert ("keyboard", "Escape") in page.actions
+
+
+SECRETS_PROMPT = {
+    "cls": "user-secrets-prompt",
+    "text": (
+        "Notebook titled 'x.ipynb' does not have access to secret named "
+        "'HF_TOKEN'. Grant access?"
+    ),
+    "actions": ["cancel", "ok"],
+}
+MCP_CONNECT_DIALOG = {
+    "cls": "wide local-mcp-connect-dialog",
+    "text": "Cancel Connect",
+    "actions": ["cancel", "ok"],
+}
+
+
+class TestBlockingDialogs:
+    """The secrets prompt raised by `userdata.get()` on an ungranted secret
+    intercepts pointer events for the whole page. Every menu-driven tool used
+    to time out behind it, including the only way to stop a runtime billing."""
+
+    @pytest.mark.asyncio
+    async def test_menu_tools_clear_a_secrets_prompt_first(self, colab, page):
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        page.add(("text", "Runtime"))
+        page.add(("text", "Disconnect and delete runtime"))
+
+        assert await colab.delete_runtime() is True
+
+        # Granted, not cancelled: the default is to give the notebook access.
+        assert page.actions.index(("grant", "user-secrets-prompt")) < page.actions.index(
+            ("click", ("text", "Runtime"))
+        )
+        assert page.dialogs == []
+
+    @pytest.mark.asyncio
+    async def test_secrets_prompt_is_cancelled_when_granting_is_off(
+        self, colab, page, monkeypatch
+    ):
+        monkeypatch.setattr(browser_mod, "GRANT_SECRETS", False)
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        page.add(("text", "Runtime"))
+        page.add(("text", "Disconnect and delete runtime"))
+
+        assert await colab.delete_runtime() is True
+        assert ("dismiss", "user-secrets-prompt") in page.actions
+        assert ("grant", "user-secrets-prompt") not in page.actions
+
+    @pytest.mark.asyncio
+    async def test_other_dialogs_are_still_cancelled(self, colab, page):
+        """Granting is only ever the answer to a secrets prompt."""
+        page.dialogs = [{"cls": "some-other-prompt", "text": "Sure?", "actions": ["cancel", "ok"]}]
+        page.add(("text", "Runtime"))
+        page.add(("text", "Restart session"))
+
+        assert await colab.restart_kernel() is True
+        assert ("dismiss", "some-other-prompt") in page.actions
+        assert ("grant", "some-other-prompt") not in page.actions
+
+    @pytest.mark.asyncio
+    async def test_stacked_prompts_are_all_cleared(self, colab, page):
+        # One instance is raised per failed userdata.get, so they stack.
+        page.dialogs = [dict(SECRETS_PROMPT), dict(SECRETS_PROMPT)]
+        page.add(("text", "Runtime"))
+        page.add(("text", "Restart session"))
+
+        assert await colab.restart_kernel() is True
+        assert page.dialogs == []
+
+    @pytest.mark.asyncio
+    async def test_the_mcp_connect_prompt_is_never_cancelled(self, colab, page):
+        """Cancelling the bridge's own dialog would sever the connection."""
+        page.dialogs = [dict(MCP_CONNECT_DIALOG)]
+        page.add(("text", "Runtime"))
+        page.add(("text", "Disconnect and delete runtime"))
+
+        await colab.delete_runtime()
+
+        assert ("dismiss", MCP_CONNECT_DIALOG["cls"]) not in page.actions
+        assert page.dialogs == [MCP_CONNECT_DIALOG]
+
+    @pytest.mark.asyncio
+    async def test_a_dialog_that_will_not_close_fails_loudly(self, colab, page):
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        page.sticky_dialogs = {"user-secrets-prompt"}
+        page.add(("text", "Runtime"))
+        page.add(("text", "Disconnect and delete runtime"))
+
+        with pytest.raises(browser_mod.BlockingDialogError) as info:
+            await colab.delete_runtime()
+        assert "HF_TOKEN" in str(info.value)
+        assert ("click", ("text", "Runtime")) not in page.actions
+
+    @pytest.mark.asyncio
+    async def test_file_menu_and_accelerator_change_are_covered_too(self, colab, page):
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        page.add(("text", "Runtime"))
+        page.add(("text", "Change runtime type"))
+        page.add(("text", "T4 GPU"))
+        page.add(("text", "Save"))
+
+        await colab.set_runtime_accelerator("T4 GPU")
+        assert ("grant", "user-secrets-prompt") in page.actions
+
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        page.add(("text", "File"))
+        page.add(("role", "menuitem", "Save"))
+        assert await colab.save_notebook() is True
+        assert page.dialogs == []
+
+    @pytest.mark.asyncio
+    async def test_dismiss_dialogs_reports_what_it_found(self, colab, page):
+        page.dialogs = [dict(SECRETS_PROMPT), dict(MCP_CONNECT_DIALOG)]
+        listed = {d["cls"]: d for d in await colab.list_dialogs()}
+        assert listed[MCP_CONNECT_DIALOG["cls"]]["protected"] is True
+
+        found = await colab.dismiss_dialogs()
+
+        by_cls = {d["cls"]: d for d in found}
+        assert by_cls["user-secrets-prompt"]["dismissed"] is True
+        assert by_cls["user-secrets-prompt"]["granted"] is True
+        assert by_cls[MCP_CONNECT_DIALOG["cls"]]["protected"] is True
+        assert browser_mod.granted_secrets(found) == ["HF_TOKEN"]
+        assert browser_mod.pending_secrets(found) == []
+
+    @pytest.mark.asyncio
+    async def test_dismiss_dialogs_can_be_told_not_to_grant(self, colab, page):
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        found = await colab.dismiss_dialogs(grant_secrets=False)
+        assert found[0]["granted"] is False
+        assert browser_mod.pending_secrets(found) == ["HF_TOKEN"]
+
+    @pytest.mark.asyncio
+    async def test_list_dialogs_is_read_only(self, colab, page):
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        found = await colab.list_dialogs()
+        assert [d["cls"] for d in found] == ["user-secrets-prompt"]
+        assert page.dialogs == [SECRETS_PROMPT]
+
+    @pytest.mark.asyncio
+    async def test_no_page(self):
+        assert await ColabBrowser().dismiss_dialogs() == []
+        assert await ColabBrowser().list_dialogs() == []
+        assert await ColabBrowser().grant_secret_prompts() == []
+
+
+class TestSecretWatcher:
+    """userdata.get() blocks on the prompt and raises after a short wait, so
+    the answer has to come while the kernel is still waiting, not when the
+    next menu tool happens to run."""
+
+    @pytest.mark.asyncio
+    async def test_grants_a_prompt_that_appears_later(self, colab, page, monkeypatch):
+        monkeypatch.setattr(browser_mod, "SECRET_POLL_S", 0.01)
+        colab.start_secret_watcher()
+        try:
+            await asyncio.sleep(0.03)
+            page.dialogs = [dict(SECRETS_PROMPT)]
+            await asyncio.sleep(0.05)
+            assert ("grant", "user-secrets-prompt") in page.actions
+            assert page.dialogs == []
+        finally:
+            await colab.close()
+        assert colab._secret_watcher is None
+
+    @pytest.mark.asyncio
+    async def test_leaves_every_other_dialog_alone(self, colab, page, monkeypatch):
+        monkeypatch.setattr(browser_mod, "SECRET_POLL_S", 0.01)
+        page.dialogs = [dict(MCP_CONNECT_DIALOG), {"cls": "confirm", "text": "?", "actions": ["cancel", "ok"]}]
+        colab.start_secret_watcher()
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            await colab.close()
+        assert [a for a in page.actions if a[0] in ("grant", "dismiss")] == []
+        assert len(page.dialogs) == 2
+
+    @pytest.mark.asyncio
+    async def test_not_started_when_granting_is_off(self, colab, page, monkeypatch):
+        monkeypatch.setattr(browser_mod, "GRANT_SECRETS", False)
+        colab.start_secret_watcher()
+        assert colab._secret_watcher is None
+
+    @pytest.mark.asyncio
+    async def test_survives_a_failing_page(self, colab, page, monkeypatch):
+        """Mid-navigation evaluate() raises; the watcher must keep going."""
+        monkeypatch.setattr(browser_mod, "SECRET_POLL_S", 0.01)
+        calls = []
+
+        async def flaky(script, arg=None):
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("Execution context was destroyed")
+            return await FakePage.evaluate(page, script, arg)
+
+        page.evaluate = flaky
+        page.dialogs = [dict(SECRETS_PROMPT)]
+        colab.start_secret_watcher()
+        try:
+            await asyncio.sleep(0.08)
+        finally:
+            await colab.close()
+        assert ("grant", "user-secrets-prompt") in page.actions
+
+    @pytest.mark.asyncio
+    async def test_started_only_once(self, colab, page, monkeypatch):
+        monkeypatch.setattr(browser_mod, "SECRET_POLL_S", 0.01)
+        colab.start_secret_watcher()
+        first = colab._secret_watcher
+        colab.start_secret_watcher()
+        try:
+            assert colab._secret_watcher is first
+        finally:
+            await colab.close()
+
+
+class TestRuntimeAttached:
+    """Read off the toolbar, never by running code: running code is exactly
+    what provisions a fresh runtime."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,expected",
+        [
+            ("Connect A100", False),
+            ("Reconnect A100", False),
+            ("Connect", False),
+            ("RAM Disk", True),
+            ("Busy", True),
+            ("Connecting...", None),
+            ("Allocating", None),
+            ("", None),
+            (None, None),
+        ],
+    )
+    async def test_reads_the_connect_button(self, colab, page, label, expected):
+        page.connect_label = label
+        assert await colab.runtime_attached() is expected
+
+    @pytest.mark.asyncio
+    async def test_no_page(self):
+        assert await ColabBrowser().runtime_attached() is None
 
 
 # --------------------------------------------------------------------------

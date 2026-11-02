@@ -35,7 +35,8 @@ import threading
 from urllib.parse import urlparse
 import webbrowser
 
-from colab_mcp.browser import ColabBrowser
+from colab_mcp.browser import ColabBrowser, granted_secrets, pending_secrets
+from colab_mcp import kernel as kernel_mod
 from colab_mcp.kernel import KernelTools, NotConnectedError
 from colab_mcp.websocket_server import (
     ColabWebSocketServer,
@@ -43,6 +44,11 @@ from colab_mcp.websocket_server import (
     COLAB_ALT_DOMAIN,
     SCRATCH_PATH,
 )
+
+
+def kernel_max_transfer_mb() -> int:
+    """The file-transfer ceiling, read at call time so tests can override it."""
+    return kernel_mod.MAX_TRANSFER_BYTES // (1024 * 1024)
 
 UI_CONNECTION_TIMEOUT = 60.0  # secs
 # After navigating, how long to let the previous tab's websocket drop before we
@@ -487,6 +493,35 @@ class ColabSessionProxy:
             path = os.path.join(tempfile.gettempdir(), "colab-mcp-screenshot.png")
             return await self.browser.screenshot(path)
 
+        async def dismiss_colab_dialog_fn(
+            dismiss: bool = True, grant_secrets: bool | None = None
+        ) -> dict:
+            """List the open Colab dialogs and, unless dismiss=False, close them."""
+            empty = {"dialogs": [], "granted_secrets": [], "pending_secrets": []}
+            if self.browser.page is None:
+                return {
+                    **empty,
+                    "error": "browser not open; call open_colab_browser_connection first",
+                }
+            try:
+                dialogs = (
+                    await self.browser.dismiss_dialogs(grant_secrets=grant_secrets)
+                    if dismiss
+                    else await self.browser.list_dialogs()
+                )
+            except Exception as e:  # noqa: BLE001
+                logging.exception("colab-mcp: dismiss_colab_dialog failed")
+                return {**empty, "error": f"{type(e).__name__}: {e}"}
+            return {
+                "dialogs": dialogs,
+                "dismissed": [d.get("text", "") for d in dialogs if d.get("dismissed")],
+                "granted_secrets": granted_secrets(dialogs),
+                # A prompt that was seen but not granted names the secret it
+                # wants; hand that to the agent so it can ask the user rather
+                # than retry into the same wall.
+                "pending_secrets": pending_secrets(dialogs),
+            }
+
         # --- kernel tools -------------------------------------------------
         # Every one of these can be called before a notebook is open, so they
         # report a disconnected frontend as data rather than raising an MCP
@@ -606,7 +641,11 @@ class ColabSessionProxy:
                     "idle session consuming compute units, or to force a clean "
                     "machine; use restart_kernel if you only need to clear memory. "
                     "Ask the user before calling this on a session holding work "
-                    "they have not saved. Returns {deleted, cancelled_pending, note}."
+                    "they have not saved. Returns {deleted, cancelled_pending, note} "
+                    "and, when the Runtime menu could not be driven, an `error` "
+                    "naming the real obstacle (for example a Colab dialog blocking "
+                    "the page, which dismiss_colab_dialog clears). deleted=false "
+                    "means the runtime is still up."
                 ),
             ),
             Tool.from_function(
@@ -714,8 +753,11 @@ class ColabSessionProxy:
                 description=(
                     "Hardware and resource state of the Colab runtime: accelerator, "
                     "gpu_name, vram_total_mb, vram_used_mb, ram_total_mb, "
-                    "disk_free_gb, connected. Runs transiently, so it leaves no cell "
-                    "behind — no need to add an nvidia-smi cell to the notebook."
+                    "disk_free_gb, connected, runtime_attached. Runs transiently, so "
+                    "it leaves no cell behind — no need to add an nvidia-smi cell to "
+                    "the notebook. When no runtime is attached (e.g. right after "
+                    "delete_runtime) it reports runtime_attached=false WITHOUT "
+                    "running anything, so it never provisions a new VM."
                 ),
             ),
             Tool.from_function(
@@ -734,7 +776,10 @@ class ColabSessionProxy:
                 description=(
                     "Copies a file from the Colab VM's filesystem to a local path. "
                     "Transferred in chunks through the kernel, so the bytes never "
-                    "enter the conversation. Returns {path, bytes, remote_bytes}."
+                    "enter the conversation. Files up to "
+                    f"{kernel_max_transfer_mb()} MB by default (COLAB_MCP_MAX_TRANSFER_BYTES "
+                    "raises it); expect roughly a minute per few hundred MB. "
+                    "Returns {path, bytes, remote_bytes}."
                 ),
             ),
             Tool.from_function(
@@ -746,6 +791,8 @@ class ColabSessionProxy:
                     "never enter the conversation. Note the VM's disk is scratch "
                     "space and does NOT survive restart_kernel or a runtime "
                     "change; to upload a notebook use import_notebook instead. "
+                    f"Files up to {kernel_max_transfer_mb()} MB by default "
+                    "(COLAB_MCP_MAX_TRANSFER_BYTES raises it). "
                     "Returns {remote_path, bytes}."
                 ),
             ),
@@ -803,6 +850,26 @@ class ColabSessionProxy:
                 description=(
                     "Saves a PNG screenshot of the current Colab browser page (the "
                     "Playwright-controlled window) and returns the file path."
+                ),
+            ),
+            Tool.from_function(
+                fn=dismiss_colab_dialog_fn,
+                name="dismiss_colab_dialog",
+                description=(
+                    "Lists the Colab dialogs currently open in the browser and, by "
+                    "default, closes them. An open dialog blocks every click on the "
+                    "page, so set_gpu_runtime, restart_kernel, delete_runtime and "
+                    "export_notebook all fail behind one. The usual culprit is the "
+                    "'Grant access?' prompt raised by google.colab.userdata.get() on "
+                    "a secret the notebook has not been granted: that one is answered "
+                    "'Grant access' (automatically, within a second, by a background "
+                    "watcher while the browser is open, unless the server runs with "
+                    "COLAB_MCP_GRANT_SECRETS=0), and every other dialog is cancelled. "
+                    "The MCP bridge's own connect prompt is left alone. Pass "
+                    "dismiss=false to only look, grant_secrets=false to cancel a "
+                    "secrets prompt instead. Returns {dialogs, dismissed, "
+                    "granted_secrets, pending_secrets}; ask the user to grant any "
+                    "pending_secrets in the notebook's Secrets panel."
                 ),
             ),
         ]
